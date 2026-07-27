@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>e2e: node_modules type resolution</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #editor {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+  <!--
+    Everything below resolves from the local `dist/` build and the vendored
+    TypeScript ESM (`/vendor/typescript.mjs`). No esm.sh / CDN is used anywhere.
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "typescript": "/vendor/typescript.mjs",
+        "modern-monaco": "/modern-monaco/index.mjs",
+        "modern-monaco/editor-core": "/modern-monaco/editor-core.mjs",
+        "modern-monaco/lsp": "/modern-monaco/lsp/index.mjs",
+        "modern-monaco/workspace": "/modern-monaco/workspace.mjs"
+      }
+    }
+  </script>
+</head>
+
+<body>
+  <div id="editor"></div>
+  <script type="module">
+    // `index.mjs` sets MonacoEnvironment.useBuiltinLSP, so builtin LSP
+    // providers (incl. typescript) are registered automatically.
+    import { init } from 'modern-monaco';
+    import { Workspace } from 'modern-monaco/workspace';
+
+    const status = (s) => { document.title = s; window.__e2eStatus = s; };
+    status('booting');
+
+    // A minimal `react` package installed in the workspace's /node_modules.
+    // The worker must read these real .d.ts files (no CDN) to type `react` and
+    // `react/jsx-runtime`.
+    const reactIndexDts = [
+      'export as namespace React;',
+      'export type Key = string | number;',
+      'export type ReactNode = string | number | boolean | null | undefined;',
+      'export interface CSSProperties {',
+      '  /** Unique marker member used by the e2e autocomplete assertion. */',
+      '  e2eUniqueCssMember?: string;',
+      '  [property: string]: string | number | undefined;',
+      '}',
+      'export interface FunctionComponent<P = {}> { (props: P): ReactNode; }',
+      'export type FC<P = {}> = FunctionComponent<P>;',
+      'export function createElement(type: string, props?: unknown, ...children: ReactNode[]): unknown;',
+      'export function useState<T>(initial: T | (() => T)): [T, (value: T) => void];',
+      'export declare const version: string;',
+      'declare const React: { createElement: typeof createElement; useState: typeof useState };',
+      'export default React;',
+      '',
+    ].join('\n');
+
+    const jsxRuntimeDts = [
+      "export * from './index';",
+      "export function jsx(type: unknown, props: unknown, key?: string): unknown;",
+      "export function jsxs(type: unknown, props: unknown, key?: string): unknown;",
+      "export const Fragment: unique symbol;",
+      '',
+    ].join('\n');
+
+    const reactPkgJson = JSON.stringify({
+      name: 'react',
+      version: '19.2.8',
+      types: './index.d.ts',
+      exports: {
+        '.': { types: './index.d.ts', default: './index.js' },
+        './jsx-runtime': { types: './jsx-runtime.d.ts', default: './jsx-runtime.js' },
+      },
+    });
+
+    const appSource = [
+      "import React, { useState } from 'react';",
+      "import { jsx, Fragment } from 'react/jsx-runtime';",
+      "import type { CSSProperties } from 'react';",
+      '',
+      'export function Counter() {',
+      "  const [count, setCount] = useState(0);",
+      '  const style: CSSProperties = {};',
+      '  const v = React.version;',
+      '  return jsx(Fragment, { children: String(count) + v });',
+      '}',
+      '',
+    ].join('\n');
+
+    const workspace = new Workspace({ name: 'e2e-node-modules' });
+    const fs = workspace.fs;
+
+    await fs.createDirectory('/src');
+    await fs.createDirectory('/node_modules/react');
+    await fs.writeFile('/node_modules/react/package.json', reactPkgJson);
+    await fs.writeFile('/node_modules/react/index.d.ts', reactIndexDts);
+    await fs.writeFile('/node_modules/react/jsx-runtime.d.ts', jsxRuntimeDts);
+    await fs.writeFile('/src/App.tsx', appSource);
+
+    // Opt into the new node_modules type resolution (no importmap / esm.sh).
+    // Note: no `defaultTheme` — the built-in default is local, so the page
+    // makes zero network requests (fully offline).
+    const monaco = await init({
+      workspace,
+      lsp: {
+        typescript: {
+          resolution: 'node_modules',
+          compilerOptions: { jsx: 'react-jsx' },
+        },
+      },
+    });
+
+    const editor = monaco.editor.create(document.getElementById('editor'), {
+      padding: { top: 8, bottom: 8 },
+    });
+    await workspace.openTextDocument('src/App.tsx');
+
+    // Test hooks
+    window.__e2e = { monaco, editor, workspace };
+    status('ready');
+  </script>
+</body>
+
+</html>

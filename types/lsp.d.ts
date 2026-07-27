@@ -194,6 +194,15 @@ declare global {
       compilerOptions?: ts.CompilerOptions;
       /** Options for the diagnostics. */
       diagnosticsOptions?: DiagnosticsOptions;
+      /**
+       * How bare module specifiers (e.g. `react`) resolve their type definitions.
+       * - `"importmap"` (default, backwards compatible): via the import map,
+       *   typically fetching `.d.ts` from a CDN over http.
+       * - `"node_modules"`: via the workspace's installed `/node_modules`, like
+       *   tsc — the real `.d.ts` of each installed package, no network.
+       * - `"auto"`: try the import map first, then fall back to `/node_modules`.
+       */
+      resolution?: "importmap" | "node_modules" | "auto";
     };
   }
 }

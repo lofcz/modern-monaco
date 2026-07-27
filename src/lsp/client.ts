@@ -95,6 +95,10 @@ export function registerBasicFeatures<
 ) {
   const { editor, languages } = monaco;
 
+  // Test/diagnostic hook: expose the live language worker so e2e tests can
+  // drive hover/completion directly and verify type resolution end to end.
+  (globalThis as Record<string, unknown>).__monacoLanguageWorker = worker;
+
   // remove document cache from worker when the model is disposed
   const onDispose = async (model: Monaco.editor.ITextModel) => {
     const workerProxy = await worker.withSyncedResources([]);

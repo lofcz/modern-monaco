@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
 import { grammars as shikiGrammars, injections } from "../node_modules/tm-grammars/index.js";
 import { themes as shikiThemes } from "../node_modules/tm-themes/index.js";
@@ -126,7 +127,10 @@ const runBuild = (entryPoints: string[], define?: Record<string, string>) => {
             }
             if (
               args.path.endsWith(".js") && args.path.startsWith(".")
-              && args.resolveDir.startsWith(new URL(import.meta.resolve("../src")).pathname)
+              // Normalize to a real filesystem path: `URL.pathname` keeps the
+              // POSIX form ("/C:/...") which never matches esbuild's Windows
+              // resolveDir ("C:\..."), silently breaking the external rewrite.
+              && args.resolveDir.startsWith(fileURLToPath(import.meta.resolve("../src")))
             ) {
               return {
                 path: args.path.replace(".js", ".mjs"),

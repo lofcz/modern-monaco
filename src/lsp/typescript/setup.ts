@@ -3,7 +3,7 @@ import type ts from "typescript";
 import type { FormattingOptions } from "vscode-languageserver-types";
 import type { Workspace } from "~/workspace";
 import type { DiagnosticsOptions } from "~/lsp/client.ts";
-import type { CreateData, Host, TypeScriptWorker, VersionedContent } from "./worker";
+import type { CreateData, Host, ModuleResolutionMode, TypeScriptWorker, VersionedContent } from "./worker";
 import { ImportMap, type ImportMapRaw, parseFromHtml } from "@esm.sh/import-map";
 
 // ! external modules, don't remove the `.js` extension
@@ -16,6 +16,15 @@ type TypeScriptLanguageSettings = {
   importMap?: ImportMap;
   compilerOptions?: CompilerOptions;
   diagnosticsOptions?: DiagnosticsOptions;
+  /**
+   * How bare module specifiers (e.g. `react`) resolve their type definitions.
+   * - `"importmap"` (default, backwards compatible): via the import map,
+   *   typically fetching `.d.ts` from a CDN over http.
+   * - `"node_modules"`: via the workspace's installed `/node_modules`, like
+   *   tsc — the real `.d.ts` of each installed package, no network.
+   * - `"auto"`: try the import map first, then fall back to `/node_modules`.
+   */
+  resolution?: ModuleResolutionMode;
 };
 
 // javascript and typescript share the same worker
@@ -34,7 +43,6 @@ export async function setup(
   if (worker instanceof Promise) {
     worker = await worker;
   }
-
   // initialize lsp client
   client.init(monaco);
 
@@ -120,11 +128,15 @@ async function createWorker(
     importMap,
     types: typesStore.types,
     fs: workspace ? await client.walkFS(workspace.fs, "/") : undefined,
+    resolution: languageSettings?.resolution,
   };
   const worker = monaco.editor.createWebWorker<TypeScriptWorker>({
     worker: getWorker(createData),
     keepIdleModels: true,
     host: {
+      // fs bridge so the worker can resolve real /node_modules package types
+      // (stat/read installed .d.ts) instead of fetching them from a CDN.
+      ...(workspace ? client.createHost(workspace) : {}),
       openModel: async (uri: string): Promise<boolean> => {
         if (!workspace) {
           throw new Error("Workspace is undefined.");
@@ -205,6 +217,15 @@ async function createWorker(
         }
       });
     });
+
+    // Keep the worker's fs view of installed packages current so bare-import
+    // type resolution (real /node_modules, no CDN) picks up newly installed or
+    // removed dependencies. Only relevant when node_modules resolution is on.
+    if (languageSettings?.resolution && languageSettings.resolution !== "importmap") {
+      fs.watch("/node_modules", { recursive: true }, (kind, filename, type) => {
+        worker.getProxy().then((proxy) => proxy.fsNotify(kind, filename, type));
+      });
+    }
   }
 
   monaco.editor.addCommand({
@@ -289,7 +310,8 @@ class TypesSet {
     const types = compilerOptions.types;
     if (Array.isArray(types)) {
       delete compilerOptions.types;
-      await Promise.all(types.map(async (type) => {
+      await Promise.all(types.map(async (rawType) => {
+        const type = String(rawType);
         if (/^https?:\/\//.test(type)) {
           const res = await cache.fetch(type);
           const dtsUrl = res.headers.get("x-typescript-types");
@@ -315,7 +337,7 @@ class TypesSet {
           try {
             return [dtsUrl, await workspace.fs.readTextFile(dtsUrl)];
           } catch (error) {
-            console.error(`Failed to read "${dtsUrl}": ` + error.message);
+            console.error(`Failed to read "${dtsUrl}": ` + (error instanceof Error ? error.message : String(error)));
           }
         }
         return null;
@@ -353,7 +375,7 @@ export async function loadImportMap(workspace: Workspace, validate: (im: ImportM
     return validate(parseFromHtml(indexHtml, "file:///"));
   } catch (error) {
     if (!isFsNotFoundError(error)) {
-      console.error("Failed to parse import map from index.html:", error.message);
+      console.error("Failed to parse import map from index.html:", error instanceof Error ? error.message : String(error));
     }
   }
   return validate(new ImportMap({}, "file:///"));

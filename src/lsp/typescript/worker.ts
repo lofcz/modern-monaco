@@ -36,7 +36,20 @@ export interface CreateData extends WorkerCreateData {
   formatOptions: ts.FormatCodeSettings & Pick<ts.UserPreferences, "quotePreference">;
   importMap: ImportMapRaw;
   types: Record<string, VersionedContent>;
+  /** How bare module specifiers resolve their types. Defaults to "importmap". */
+  resolution?: ModuleResolutionMode;
 }
+
+/**
+ * How bare module specifiers (e.g. `react`) resolve their type definitions:
+ * - `"importmap"` (default, backwards compatible): via the import map —
+ *   typically fetching `.d.ts` from a CDN (esm.sh) over http.
+ * - `"node_modules"`: via the workspace's installed `/node_modules`, like tsc —
+ *   reading the real `.d.ts` of each installed package. No network, no import
+ *   map required.
+ * - `"auto"`: try the import map first, then fall back to `/node_modules`.
+ */
+export type ModuleResolutionMode = "importmap" | "node_modules" | "auto";
 
 /** TypeScriptWorker removes all but the `fileName` property to avoid serializing circular JSON structures. */
 export interface DiagnosticRelatedInformation extends Omit<ts.DiagnosticRelatedInformation, "file"> {
@@ -57,6 +70,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   #formatOptions?: CreateData["formatOptions"];
   #importMap: ImportMap;
   #importMapVersion: number;
+  #resolution: ModuleResolutionMode;
   #types: Record<string, VersionedContent>;
   #urlMappings = new Map<string, string>();
   #typesMappings = new Map<string, string>();
@@ -69,6 +83,12 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   #openPromises = new Map<string, Promise<void>>();
   #fetchPromises = new Map<string, Promise<void>>();
   #httpDocumentCache = new Map<string, TextDocument>();
+  /** Resolved package types entry: `file:///node_modules/<pkg>` -> types .d.ts href. */
+  #pkgTypes = new Map<string, string>();
+  /** package.json text for installed packages: `file:///node_modules/<pkg>/package.json` -> json. */
+  #pkgJson = new Map<string, string>();
+  /** In-flight package probes, keyed by bare specifier (dedupes host fs_stat round-trips). */
+  #pkgProbes = new Map<string, Promise<void>>();
 
   constructor(ctx: monacoNS.worker.IWorkerContext<Host>, createData: CreateData) {
     super(ctx, createData);
@@ -76,6 +96,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     this.#languageService = ts.createLanguageService(this);
     this.#importMap = new ImportMap(createData.importMap, "file:///");
     this.#importMapVersion = 0;
+    this.#resolution = createData.resolution ?? "importmap";
     this.#types = createData.types;
     this.#formatOptions = createData.formatOptions;
     this.#updateJsxImportSource();
@@ -122,7 +143,11 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   }
 
   fileExists(filename: string): boolean {
-    if (filename.startsWith("/node_modules/")) return false;
+    // Bare-specifier type resolution (node_modules mode) resolves real .d.ts
+    // files under /node_modules and opens them as background models; TS must be
+    // allowed to read those. Everything else under /node_modules stays invisible
+    // to TS (the importmap mode never reads from there).
+    if (filename.startsWith("/node_modules/")) return this.hasModel(filename);
     return (
       filename in libs
       || `lib.${filename}.d.ts` in libs
@@ -241,6 +266,27 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       importMapResolved = resolved;
       if (importMapResolved) {
         specifier = url;
+      }
+      // Real node_modules type resolution (opt-in via `resolution`): a bare
+      // specifier that the import map doesn't resolve is looked up in the
+      // workspace's installed /node_modules, like tsc — reading the real .d.ts
+      // of each installed package instead of fetching types from a CDN.
+      // "auto" tries the import map first (above), then falls back here.
+      if (
+        !importMapResolved
+        && !isHttpUrl(specifier)
+        && !isRelativePath(specifier)
+        && this.#resolution !== "importmap"
+      ) {
+        const nodeResolved = this.#resolveNodeModuleTypes(specifier, containingFile);
+        if (nodeResolved) {
+          return nodeResolved;
+        }
+        // In "auto" mode, fall through to the http/CDN path below when the
+        // package isn't installed; in "node_modules" mode there is no fallback.
+        if (this.#resolution === "node_modules") {
+          return undefined;
+        }
       }
       if (!importMapResolved && !isHttpUrl(specifier) && !isRelativePath(specifier)) {
         return undefined;
@@ -1136,6 +1182,148 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     }
   }
 
+  /**
+   * Resolve a bare module specifier (e.g. `react`, `react/jsx-runtime`) to the
+   * real `.d.ts` of the installed package under `/node_modules`, the way tsc
+   * does — reading the package's `package.json` (`types`/`exports`/`main`).
+   *
+   * Synchronous like the rest of `resolveModuleNameLiterals`: returns a
+   * resolution only when the target `.d.ts` is already known (mirror model or
+   * walked fs). On a cache miss it kicks off an async package probe that
+   * discovers the types entry through the host fs bridge, then rolls the
+   * containing file's version back so TS re-resolves — the same pattern the
+   * `file:` import branch uses with `host.openModel`.
+   */
+  #resolveNodeModuleTypes(
+    specifier: string,
+    containingFile: string,
+  ): { resolvedFileName: string; extension: ts.Extension } | undefined {
+    const { pkgRoot, pkgName, subpath } = splitNodeSpecifier(specifier);
+    if (!pkgName) return undefined;
+
+    // Fast path: we already resolved this package's types entry.
+    const knownEntry = this.#pkgTypes.get(pkgRoot + (subpath ? "/" + subpath : ""));
+    if (knownEntry && this.hasFsPath(knownEntry)) {
+      return this.#openAndResolve(knownEntry, containingFile);
+    }
+
+    // Synchronous candidate scan: try the conventional .d.ts locations that we
+    // already know exist (mirror models / walked fs / stat cache).
+    const pkgJson = this.#pkgJson.get(pkgRoot + "/package.json");
+    for (const candidate of this.#nodeTypesCandidates(pkgRoot, subpath, pkgJson)) {
+      if (this.hasModel(candidate) || this.hasFsPath(candidate)) {
+        this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), candidate);
+        return this.#openAndResolve(candidate, containingFile);
+      }
+    }
+
+    // Miss: asynchronously probe the package via the host fs bridge, then
+    // re-resolve. Deduped per specifier.
+    if (!this.#pkgProbes.has(specifier)) {
+      const probe = this.#probeNodeModule(pkgRoot, pkgName, subpath)
+        .finally(() => {
+          this.#pkgProbes.delete(specifier);
+          this.#rollbackVersion(containingFile);
+          this.host.refreshDiagnostics(containingFile);
+        });
+      this.#pkgProbes.set(specifier, probe);
+    }
+    return undefined;
+  }
+
+  /** Open the resolved .d.ts as a (background) model and return its resolution. */
+  #openAndResolve(
+    dtsHref: string,
+    containingFile: string,
+  ): { resolvedFileName: string; extension: ts.Extension } | undefined {
+    const extension = (getScriptExtension(dtsHref) ?? ".d.ts") as ts.Extension;
+    for (const model of this.getMirrorModels()) {
+      if (dtsHref === model.uri.toString()) {
+        return { resolvedFileName: dtsHref, extension };
+      }
+    }
+    if (!this.hasFileSystemProvider) return undefined;
+    // Ensure the model exists so TS can read its text; re-resolve afterwards.
+    if (!this.#openPromises.has(dtsHref)) {
+      this.#openPromises.set(
+        dtsHref,
+        this.host.openModel(dtsHref).then((ok) => {
+          if (!ok) {
+            this.#badImports.add(dtsHref);
+            this.#rollbackVersion(containingFile);
+          }
+        }).finally(() => {
+          this.#openPromises.delete(dtsHref);
+          this.host.refreshDiagnostics(containingFile);
+        }),
+      );
+    }
+    return { resolvedFileName: dtsHref, extension };
+  }
+
+  /** Conventional .d.ts candidate paths for `<pkgRoot>/<subpath>`. */
+  #nodeTypesCandidates(pkgRoot: string, subpath: string, pkgJsonText?: string): string[] {
+    const out: string[] = [];
+    if (pkgJsonText) {
+      try {
+        const pkg = JSON.parse(pkgJsonText);
+        if (subpath === "") {
+          const entry = resolveTypesEntry(pkg);
+          if (entry) out.push(pkgRoot + "/" + entry);
+        } else {
+          const sub = resolveExportsTypes(pkg, subpath);
+          if (sub) out.push(pkgRoot + "/" + sub);
+        }
+      } catch {
+        // ignore malformed package.json
+      }
+    }
+    if (subpath === "") {
+      out.push(
+        pkgRoot + "/index.d.ts",
+        pkgRoot + "/index.d.mts",
+      );
+    } else {
+      const base = pkgRoot + "/" + subpath;
+      out.push(
+        base + ".d.ts",
+        base + ".d.mts",
+        base + "/index.d.ts",
+        base + "/index.d.mts",
+      );
+    }
+    return out;
+  }
+
+  /**
+   * Probe an installed package through the host fs bridge: read its
+   * package.json, compute the types entry, verify the .d.ts exists, then open
+   * it as a model so its text is available to the language service.
+   */
+  async #probeNodeModule(pkgRoot: string, pkgName: string, subpath: string): Promise<void> {
+    const pkgJsonHref = pkgRoot + "/package.json";
+    // Cache the package.json for future synchronous resolutions.
+    if (!this.#pkgJson.has(pkgJsonHref)) {
+      try {
+        this.#pkgJson.set(pkgJsonHref, await this.fsRead(pkgJsonHref));
+      } catch {
+        this.#pkgJson.set(pkgJsonHref, "");
+      }
+    }
+    const pkgJson = this.#pkgJson.get(pkgJsonHref);
+    for (const candidate of this.#nodeTypesCandidates(pkgRoot, subpath, pkgJson)) {
+      const type = await this.fsProbe(candidate);
+      if (type === 1) {
+        this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), candidate);
+        await this.host.openModel(candidate);
+        return;
+      }
+    }
+    // No types found; remember so we don't keep probing. (Package may be
+    // untyped — that's fine, tsc reports it the same way.)
+    this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), "");
+  }
+
   #getScriptText(fileName: string): string | undefined {
     return libs[fileName]
       ?? libs[`lib.${fileName}.d.ts`]
@@ -1414,6 +1602,82 @@ function isWellKnownCDNURL(url: URL): boolean {
 
 function isDts(fileName: string): boolean {
   return fileName.endsWith(".d.ts") || fileName.endsWith(".d.mts") || fileName.endsWith(".d.cts");
+}
+
+/** Split a bare specifier into its package root href, package name, and subpath. */
+function splitNodeSpecifier(specifier: string): { pkgRoot: string; pkgName: string; subpath: string } {
+  const parts = specifier.split("/");
+  let pkgName: string;
+  let rest: string[];
+  if (specifier.startsWith("@")) {
+    pkgName = parts.slice(0, 2).join("/");
+    rest = parts.slice(2);
+  } else {
+    pkgName = parts[0];
+    rest = parts.slice(1);
+  }
+  return {
+    pkgRoot: "file:///node_modules/" + pkgName,
+    pkgName,
+    subpath: rest.join("/"),
+  };
+}
+
+/**
+ * Pick the types entry file from a package.json, honouring `types`/`typings`,
+ * then the `exports` "." types condition, then the `.d.ts` twin of
+ * `main`/`module`.
+ */
+function resolveTypesEntry(pkg: Record<string, unknown>): string | null {
+  const types = pkg["types"] ?? pkg["typings"];
+  if (typeof types === "string") return stripLeadingDotSlash(types);
+  const exportsTypes = resolveExportsTypes(pkg, ".");
+  if (exportsTypes) return exportsTypes;
+  for (const key of ["main", "module"]) {
+    const v = pkg[key];
+    if (typeof v === "string") {
+      const dts = v.replace(/\.(m?js|cjs)$/, "");
+      return stripLeadingDotSlash(dts) + ".d.ts";
+    }
+  }
+  return null;
+}
+
+/** Resolve the `types` condition of an `exports` subpath (`"."` for the entry). */
+function resolveExportsTypes(pkg: Record<string, unknown>, subpath: string): string | null {
+  const exports = pkg["exports"];
+  if (exports == null || typeof exports !== "object") return null;
+  const key = subpath === "" || subpath === "." ? "." : "./" + subpath;
+  const pickTypes = (v: unknown): string | null => {
+    if (typeof v === "string") {
+      // A string target that is itself a .d.ts is the types entry.
+      return isDts(v) ? stripLeadingDotSlash(v) : null;
+    }
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      // Prefer the explicit `types` condition, then recurse into import/require/default.
+      if ("types" in o) {
+        const r = pickTypes(o["types"]);
+        if (r) return r;
+      }
+      for (const cond of ["import", "require", "node", "default"]) {
+        if (cond in o) {
+          const r = pickTypes(o[cond]);
+          if (r) return r;
+        }
+      }
+    }
+    return null;
+  };
+  const o = exports as Record<string, unknown>;
+  if (key in o) return pickTypes(o[key]);
+  // No subpath keys → the whole exports object is the entry conditions.
+  if (!Object.keys(o).some((k) => k.startsWith("."))) return pickTypes(o);
+  return null;
+}
+
+function stripLeadingDotSlash(p: string): string {
+  return p.startsWith("./") ? p.slice(2) : p;
 }
 
 function pathToUrl(path: string): URL {

@@ -4,3 +4,7 @@ dist/
 types/monaco.d.ts
 types/textmate.d.ts
 types/jsonSchema.d.ts
+test-results/
+playwright-report/
+blob-report/
+e2e-server.log
