@@ -92,7 +92,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/esm-dev/modern-monaco.git"
+    "url": "git+https://github.com/lofcz/modern-monaco.git"
   },
   "license": "MIT"
 }
