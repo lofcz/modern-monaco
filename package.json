@@ -1,7 +1,7 @@
 {
   "name": "@lofcz/modern-monaco",
   "description": "A modern version of Monaco Editor",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.mjs",
   "module": "./dist/index.mjs",
@@ -69,7 +69,9 @@
     "process": false,
     "buffer": false
   },
-  "sideEffects": ["dist/index.mjs"],
+  "sideEffects": [
+    "dist/index.mjs"
+  ],
   "devDependencies": {
     "@esm.sh/import-map": "0.4.0",
     "@playwright/test": "^1.62.0",
