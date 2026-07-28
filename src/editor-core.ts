@@ -16,6 +16,13 @@ const defaultEditorOptions: editor.IStandaloneEditorConstructionOptions = {
   // Disable until upstream paste with EditContext is reliable.
   // See: microsoft/monaco-editor#5079, #5158; eclipse-theia/theia#17179.
   editContext: false,
+  // pasteAs (CopyPasteController) claims every paste event via setHandled(),
+  // then awaits navigator.clipboard.read() for vscode URI-list metadata.
+  // When clipboard-read permission is "prompt" that await never settles, so
+  // Ctrl+V / Edit→Paste insert nothing. Standalone embeds don't need paste
+  // providers — the textarea already has clipboardData.text. Turn pasteAs
+  // off so TextAreaInput applies the paste synchronously.
+  pasteAs: { enabled: false },
 };
 
 const { create, createModel, getModel } = editor;
