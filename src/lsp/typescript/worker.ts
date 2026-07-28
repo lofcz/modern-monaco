@@ -534,16 +534,29 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     }
     const ext = getScriptExtension(uri);
     const diagnostics: lst.Diagnostic[] = [];
-    for (const diagnostic of this.#languageService.getSyntacticDiagnostics(uri)) {
-      diagnostics.push(this.#convertDiagnostic(document, diagnostic));
-    }
-    for (const diagnostic of this.#languageService.getSuggestionDiagnostics(uri)) {
-      diagnostics.push(this.#convertDiagnostic(document, diagnostic));
-    }
-    if (ext === ".tsx" || ext?.endsWith("ts")) {
-      for (const diagnostic of this.#languageService.getSemanticDiagnostics(uri)) {
+    try {
+      for (const diagnostic of this.#languageService.getSyntacticDiagnostics(uri)) {
         diagnostics.push(this.#convertDiagnostic(document, diagnostic));
       }
+      for (const diagnostic of this.#languageService.getSuggestionDiagnostics(uri)) {
+        diagnostics.push(this.#convertDiagnostic(document, diagnostic));
+      }
+      if (ext === ".tsx" || ext?.endsWith("ts")) {
+        for (const diagnostic of this.#languageService.getSemanticDiagnostics(uri)) {
+          diagnostics.push(this.#convertDiagnostic(document, diagnostic));
+        }
+      }
+    } catch (error) {
+      // TypeScript throws when a synced model/URI isn't in the program yet
+      // (dependency openModel race, http .d.ts still fetching). Retry on the
+      // next content/refresh cycle instead of rejecting the RPC.
+      if (
+        error instanceof Error
+        && error.message.includes("Could not find source file")
+      ) {
+        return null;
+      }
+      throw error;
     }
     if (this.#redirectedImports.length > 0) {
       this.#redirectedImports.forEach(([modelUrl, node, url]) => {

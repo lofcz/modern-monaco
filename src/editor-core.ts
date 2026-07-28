@@ -9,6 +9,13 @@ const defaultEditorOptions: editor.IStandaloneEditorConstructionOptions = {
   minimap: { enabled: false },
   stickyScroll: { enabled: false },
   scrollBeyondLastLine: false,
+  // monaco-editor-core ≥0.53 defaults editContext:true on Chrome/Edge. The
+  // native EditContext input path breaks Ctrl+V / context-menu paste in
+  // standalone embeds (no textarea to receive the browser paste event;
+  // clipboardService.readText often fails without a privileged gesture).
+  // Disable until upstream paste with EditContext is reliable.
+  // See: microsoft/monaco-editor#5079, #5158; eclipse-theia/theia#17179.
+  editContext: false,
 };
 
 const { create, createModel, getModel } = editor;

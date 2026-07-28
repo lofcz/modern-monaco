@@ -107,9 +107,20 @@ export function registerBasicFeatures<
 ) {
   const { editor, languages } = monaco;
 
-  // Test/diagnostic hook: expose the live language worker so e2e tests can
-  // drive hover/completion directly and verify type resolution end to end.
-  (globalThis as Record<string, unknown>).__monacoLanguageWorker = worker;
+  // Host/test hook: expose the TypeScript worker only. HTML/CSS/JSON also call
+  // registerBasicFeatures; overwriting this global with those workers made
+  // host calls like `updateCompilerOptions` fail with
+  // "Missing requestHandler or method: updateCompilerOptions" once an HTML
+  // file was opened (html LSP registered last).
+  if (
+    languageId === "typescript"
+    || languageId === "javascript"
+    || languageId === "jsx"
+    || languageId === "tsx"
+  ) {
+    (globalThis as Record<string, unknown>).__monacoLanguageWorker = worker;
+    (globalThis as Record<string, unknown>).__monacoTsWorker = worker;
+  }
 
   // remove document cache from worker when the model is disposed
   const onDispose = async (model: Monaco.editor.ITextModel) => {
@@ -191,25 +202,30 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
   const { editor } = monaco;
   const modelChangeListeners = new Map<string, Monaco.IDisposable>();
   const doValidate = async (model: Monaco.editor.ITextModel) => {
-    const workerProxy = await worker.withSyncedResources([model.uri]);
-    const diagnostics = await workerProxy.doValidation(model.uri.toString());
-    if (diagnostics && !model.isDisposed()) {
-      let markers = diagnostics.map(diagnosticToMarker);
-      if (options?.filter) {
-        markers = markers.filter(options.filter);
-      }
-      if (options?.codesToIgnore) {
-        markers = markers.filter(marker => {
-          const code = typeof marker.code === "string" ? marker.code : marker.code?.value;
-          for (const codeToIgnore of options!.codesToIgnore!) {
-            if (code && code === String(codeToIgnore)) {
-              return false;
+    try {
+      const workerProxy = await worker.withSyncedResources([model.uri]);
+      const diagnostics = await workerProxy.doValidation(model.uri.toString());
+      if (diagnostics && !model.isDisposed()) {
+        let markers = diagnostics.map(diagnosticToMarker);
+        if (options?.filter) {
+          markers = markers.filter(options.filter);
+        }
+        if (options?.codesToIgnore) {
+          markers = markers.filter(marker => {
+            const code = typeof marker.code === "string" ? marker.code : marker.code?.value;
+            for (const codeToIgnore of options!.codesToIgnore!) {
+              if (code && code === String(codeToIgnore)) {
+                return false;
+              }
             }
-          }
-          return true;
-        });
+            return true;
+          });
+        }
+        monaco.editor.setModelMarkers(model, languageId, markers);
       }
-      monaco.editor.setModelMarkers(model, languageId, markers);
+    } catch {
+      // Transient races (file not yet in the TS program, pending .d.ts fetch,
+      // disposed model) must not surface as unhandled promise rejections.
     }
   };
   const validateModel = (model: Monaco.editor.IModel): void => {
@@ -226,13 +242,13 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
       }
       timer = setTimeout(() => {
         timer = null;
-        doValidate(model);
+        void doValidate(model);
       }, 500);
     };
 
     modelChangeListeners.set(uri, model.onDidChangeContent(validate));
     Reflect.set(model, "refreshDiagnostics", validate);
-    doValidate(model);
+    void doValidate(model);
   };
   const onModelDispose = (model: Monaco.editor.IModel): void => {
     const uri = model.uri.toString();
