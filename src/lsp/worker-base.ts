@@ -198,6 +198,52 @@ export class WorkerBase<Host = undefined, LanguageDocument = undefined> {
     return entries;
   }
 
+  /**
+   * Recursively walk a directory through the host fs bridge, registering every
+   * entry in the synchronous fs index, and return the file hrefs found.
+   *
+   * The index built at construction only covers files that existed when the
+   * worker started, and bulk installs deliberately suppress per-file watch
+   * events (thousands of node_modules writes are not application modules). So
+   * for a package installed at runtime `listFilesRecursive` sees nothing until
+   * this walk discovers it.
+   */
+  async fsWalk(uri: string, extensions?: readonly string[], depth = 8): Promise<string[]> {
+    const host = this.#ctx.host as {
+      fs_readDirectory?: (uri: string) => Promise<[string, FileSystemEntryType][]>;
+    };
+    if (typeof host?.fs_readDirectory !== "function") {
+      return [];
+    }
+    const fs = this.#fs ?? (this.#fs = new Map());
+    const out: string[] = [];
+    const walk = async (dir: string, remaining: number): Promise<void> => {
+      if (remaining < 0) return;
+      let entries: [string, FileSystemEntryType][];
+      try {
+        entries = await host.fs_readDirectory!(dir);
+      } catch {
+        return;
+      }
+      fs.set(dir, 2);
+      await Promise.all(entries.map(async ([name, type]) => {
+        const href = dir + "/" + name;
+        if (type === 2) {
+          await walk(href, remaining - 1);
+          return;
+        }
+        fs.set(href, type);
+        this.#statCache.set(href, type);
+        this.#trackNodeModule(href);
+        if (!extensions || extensions.some((ext) => href.endsWith(ext))) {
+          out.push(href);
+        }
+      }));
+    };
+    await walk(uri.endsWith("/") ? uri.slice(0, -1) : uri, depth);
+    return out;
+  }
+
   /** Recursively list all file hrefs under a directory (uses the walked fs). */
   listFilesRecursive(uri: string, extensions?: readonly string[]): string[] {
     const out: string[] = [];
@@ -257,6 +303,14 @@ export class WorkerBase<Host = undefined, LanguageDocument = undefined> {
       ? (path.length > "file:///".length && path.endsWith("/") ? path.slice(0, -1) : path)
       : "file://" + (path.startsWith("/") ? path : "/" + path);
     if (kind === "create") {
+      // Anything we previously recorded as missing may exist now — a package
+      // install writes a whole subtree, not just the notified path, so every
+      // known-missing answer is suspect. Negative entries are only a
+      // round-trip optimization, so dropping them all is cheap and correct;
+      // keeping them made a failed pre-install type lookup permanent.
+      for (const [uri, entryType] of this.#statCache) {
+        if (entryType === 0) this.#statCache.delete(uri);
+      }
       if (type) {
         const entryType = type as FileSystemEntryType;
         fs.set(href, entryType);

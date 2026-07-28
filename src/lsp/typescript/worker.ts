@@ -99,10 +99,17 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
    * (e.g. lucide-react) flooded the main thread and froze the editor.
    */
   #nodeModulesContent = new Map<string, string>();
+  /** TextDocuments for cached node_modules declarations, keyed by href; the
+   *  tuple's first slot is the text it was built from (its cache key). */
+  #nodeModulesDocumentCache = new Map<string, [text: string, document: TextDocument]>();
   /** In-flight content fetches, keyed by `.d.ts` href (dedupes parallel reads). */
   #nodeModulesFetches = new Map<string, Promise<void>>();
   /** In-flight bulk package prefetches, keyed by package root. */
   #pkgPrefetches = new Map<string, Promise<void>>();
+  /** Declaration twin for an ESM `.js` module href ("" = the module has none). */
+  #dtsTwins = new Map<string, string>();
+  /** In-flight declaration-twin probes, keyed by module href. */
+  #dtsTwinProbes = new Map<string, Promise<void>>();
   /** Bumped when node_modules content is cached, so TS re-reads those files. */
   #nodeModulesVersion = 0;
   /** Bumped when CDN/http `.d.ts` libs are cached (esm.sh etc.). */
@@ -137,7 +144,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       }
       return names;
     }
-    if (path.startsWith("file:///node_modules/")) {
+    if (path.startsWith("file:///node_modules/") && this.#resolution === "importmap") {
       // todo: use closest index.html(importmap)
       const dirname = path.slice("file:///node_modules/".length);
       return Object.keys(this.#importMap.imports)
@@ -156,7 +163,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     include?: readonly string[],
     depth?: number,
   ): string[] {
-    if (path.startsWith("file:///node_modules/")) {
+    if (path.startsWith("file:///node_modules/") && this.#resolution === "importmap") {
       // todo: use closest index.html(importmap)
       const dirname = path.slice("file:///node_modules/".length);
       return Object.keys(this.#importMap.imports)
@@ -229,7 +236,30 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     // newly-fetched CDN `.d.ts` (esm.sh / same-origin proxy) invalidates the
     // program. Without this, TS keeps the initial `.js`/7016 resolution forever
     // even after x-typescript-types has been fetched and cached.
-    return "nm" + this.#nodeModulesVersion + ".h" + this.#httpLibsVersion + ".i" + this.#importMapVersion;
+    //
+    // The open-model signature is what lets a file opened later join the
+    // program at all: TS skips `getScriptFileNames()` entirely while the
+    // project version is unchanged, so without it every feature on a
+    // newly-opened file fails with "Could not find source file".
+    return "nm" + this.#nodeModulesVersion + ".h" + this.#httpLibsVersion + ".i" + this.#importMapVersion
+      + ".m" + this.#mirrorModelsSignature();
+  }
+
+  /** Order-independent signature of the synced model set (count + XOR of URI hashes). */
+  #mirrorModelsSignature(): string {
+    let count = 0;
+    let signature = 0;
+    for (const model of this.getMirrorModels()) {
+      count++;
+      const uri = model.uri.toString();
+      let hash = 2166136261;
+      for (let i = 0; i < uri.length; i++) {
+        hash ^= uri.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      signature ^= hash;
+    }
+    return count + "_" + (signature >>> 0).toString(36);
   }
 
   getScriptVersion(fileName: string): string {
@@ -361,6 +391,14 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
         const moduleHref = moduleUrl.href;
         if (this.#badImports.has(moduleHref)) {
           return undefined;
+        }
+        // Packages built for `moduleResolution: node16`/`bundler` write ESM
+        // specifiers into their own declarations (`export { X } from "./X.js"`).
+        // tsc resolves those to the sibling declaration file; resolving them to
+        // the emitted `.js` drops every type the package ships.
+        const twin = this.#resolveDeclarationTwin(moduleUrl, containingFile);
+        if (twin) {
+          return this.#openAndResolve(twin, containingFile);
         }
         for (const model of this.getMirrorModels()) {
           if (moduleHref === model.uri.toString()) {
@@ -1319,6 +1357,57 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     return undefined;
   }
 
+  /**
+   * Sibling declaration file for an ESM `.js`/`.mjs`/`.cjs` module path.
+   *
+   * Returns undefined when the module is plain JavaScript with no declaration
+   * twin, or when the twin has not been discovered yet — in the latter case an
+   * async probe is started and `containingFile` re-resolves once it lands, the
+   * same pattern `#resolveNodeModuleTypes` uses.
+   */
+  #resolveDeclarationTwin(moduleUrl: URL, containingFile: string): string | undefined {
+    const twins = declarationTwins(moduleUrl.pathname);
+    if (twins.length === 0) return undefined;
+
+    const moduleHref = moduleUrl.href;
+    const cached = this.#dtsTwins.get(moduleHref);
+    if (cached !== undefined) return cached || undefined;
+
+    const hrefFor = (pathname: string): string => {
+      const url = new URL(moduleUrl.href);
+      url.pathname = pathname;
+      return url.href;
+    };
+
+    for (const pathname of twins) {
+      const href = hrefFor(pathname);
+      if (this.hasModel(href) || this.hasFsPath(href) || this.#nodeModulesContent.has(href)) {
+        this.#dtsTwins.set(moduleHref, href);
+        return href;
+      }
+    }
+
+    if (!this.hasFileSystemProvider) return undefined;
+    if (!this.#dtsTwinProbes.has(moduleHref)) {
+      const probe = (async () => {
+        for (const pathname of twins) {
+          const href = hrefFor(pathname);
+          if (await this.fsProbe(href) === 1) {
+            this.#dtsTwins.set(moduleHref, href);
+            return;
+          }
+        }
+        this.#dtsTwins.set(moduleHref, "");
+      })().finally(() => {
+        this.#dtsTwinProbes.delete(moduleHref);
+        this.#rollbackVersion(containingFile);
+        this.host.refreshDiagnostics(containingFile);
+      });
+      this.#dtsTwinProbes.set(moduleHref, probe);
+    }
+    return undefined;
+  }
+
   /** Open the resolved .d.ts as a (background) model and return its resolution. */
   #openAndResolve(
     dtsHref: string,
@@ -1480,6 +1569,25 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
         cleared = true;
       }
     }
+    for (const [key, value] of this.#dtsTwins) {
+      if (value === "") {
+        this.#dtsTwins.delete(key);
+        cleared = true;
+      }
+    }
+    // A failed package.json read is what makes #probeNodeModule give up on a
+    // package; keeping it cached survives the install that would fix it.
+    for (const [key, value] of this.#pkgJson) {
+      if (value === "") {
+        this.#pkgJson.delete(key);
+        cleared = true;
+      }
+    }
+    if (kind === "create") {
+      // A prefetch that ran before the package existed found nothing and would
+      // never run again; let the next resolution re-walk the package.
+      this.#pkgPrefetches.clear();
+    }
     if (cleared || kind === "create") {
       this.#nodeModulesVersion++;
     }
@@ -1494,8 +1602,14 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     let pending = this.#pkgPrefetches.get(pkgRoot);
     if (!pending) {
       pending = (async () => {
-        const files = this.listFilesRecursive(pkgRoot, [".d.ts", ".d.mts", ".d.cts"])
-          .filter((f) => !this.#nodeModulesContent.has(f));
+        const extensions = [".d.ts", ".d.mts", ".d.cts"];
+        let discovered = this.listFilesRecursive(pkgRoot, extensions);
+        if (discovered.length === 0) {
+          // Installed after the worker's initial workspace walk — bulk installs
+          // suppress the per-file watch events that would have indexed it.
+          discovered = await this.fsWalk(pkgRoot, extensions);
+        }
+        const files = discovered.filter((f) => !this.#nodeModulesContent.has(f));
         // Batched reads (one bridge round-trip per chunk) — see fsReadBatch.
         const CHUNK = 64;
         for (let i = 0; i < files.length; i += CHUNK) {
@@ -1528,6 +1642,21 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     const doc = this.getTextDocument(uri);
     if (doc) {
       return doc;
+    }
+    // Dependency declarations live in the worker's content cache rather than a
+    // Monaco model (opening a model per `.d.ts` floods the main thread). They
+    // still need a document so definitions, references and hovers can report
+    // positions inside them — without this, go-to-definition on an import from
+    // /node_modules silently returns nothing.
+    const nodeModulesText = this.#nodeModulesContent.get(uri);
+    if (nodeModulesText !== undefined) {
+      const cached = this.#nodeModulesDocumentCache.get(uri);
+      if (cached && cached[0] === nodeModulesText) {
+        return cached[1];
+      }
+      const document = TextDocument.create(uri, "typescript", this.#nodeModulesVersion, nodeModulesText);
+      this.#nodeModulesDocumentCache.set(uri, [nodeModulesText, document]);
+      return document;
     }
     if (uri.startsWith("http://") || uri.startsWith("https://")) {
       const docCache = this.#httpDocumentCache;
@@ -1810,6 +1939,30 @@ function isWellKnownCDNURL(url: URL): boolean {
 
 function isDts(fileName: string): boolean {
   return fileName.endsWith(".d.ts") || fileName.endsWith(".d.mts") || fileName.endsWith(".d.cts");
+}
+
+/**
+ * Declaration-file twins for a JS module path, in tsc's lookup order. Empty for
+ * paths that are not JavaScript (nothing to substitute).
+ */
+function declarationTwins(pathname: string): string[] {
+  if (pathname.endsWith(".mjs")) {
+    const base = pathname.slice(0, -4);
+    return [base + ".d.mts", base + ".mts"];
+  }
+  if (pathname.endsWith(".cjs")) {
+    const base = pathname.slice(0, -4);
+    return [base + ".d.cts", base + ".cts"];
+  }
+  if (pathname.endsWith(".jsx")) {
+    const base = pathname.slice(0, -4);
+    return [base + ".d.ts", base + ".tsx"];
+  }
+  if (pathname.endsWith(".js")) {
+    const base = pathname.slice(0, -3);
+    return [base + ".d.ts", base + ".ts", base + ".tsx"];
+  }
+  return [];
 }
 
 /** Split a bare specifier into its package root href, package name, and subpath. */

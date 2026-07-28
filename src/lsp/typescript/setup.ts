@@ -142,13 +142,8 @@ async function createWorker(
           throw new Error("Workspace is undefined.");
         }
         try {
-          const editors = monaco.editor.getEditors();
-          const editor = editors.find(e => e.hasWidgetFocus() || e.hasTextFocus()) ?? editors[0];
-          if (editor) {
-            await workspace._openTextDocument(monaco, editor, uri);
-            return true;
-          }
-          return false;
+          await workspace._openBackgroundDocument(monaco, uri);
+          return true;
         } catch (error) {
           if (isFsNotFoundError(error)) {
             return false;

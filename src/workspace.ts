@@ -108,6 +108,28 @@ export class Workspace implements IWorkspace {
     return this._openTextDocument(monaco, editor ?? await getEditor(), uri, undefined, content);
   }
 
+  /**
+   * Materialize a model for the language service without touching any editor.
+   *
+   * The TypeScript worker asks for the files an open document imports so it can
+   * type them. That is not a navigation: attaching those models would rip the
+   * visible editor away from the file the user opened, and it must not depend on
+   * an editor having focus (or existing at all) to succeed.
+   */
+  async _openBackgroundDocument(
+    monaco: typeof monacoNS,
+    uri: string | URL,
+  ): Promise<monacoNS.editor.ITextModel> {
+    const href = normalizeURL(uri).href;
+    const modelUri = monaco.Uri.parse(href);
+    const existing = monaco.editor.getModel(modelUri);
+    if (existing) {
+      return existing;
+    }
+    const content = await this._fs.readTextFile(href);
+    return monaco.editor.createModel(content, undefined, modelUri);
+  }
+
   async _openTextDocument(
     monaco: typeof monacoNS,
     editor: monacoNS.editor.ICodeEditor,

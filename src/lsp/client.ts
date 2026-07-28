@@ -6,6 +6,8 @@ import * as lst from "vscode-languageserver-types";
 import { cache } from "../cache.js";
 
 let monaco: typeof Monaco;
+/** The active workspace, so navigation targets can be read from its fs. */
+let activeWorkspace: Workspace | undefined;
 
 /** init the monaco namespace. */
 export function init(monacoNS: typeof Monaco): void {
@@ -142,6 +144,8 @@ export function registerBasicFeatures<
   if (diagnosticsOptions?.validate ?? true) {
     registerDiagnostics(languageId, worker, diagnosticsOptions);
   }
+
+  activeWorkspace ??= workspace;
 
   // register language features
   languages.registerCompletionItemProvider(languageId, new CompletionAdapter(worker, completionTriggerCharacters));
@@ -992,7 +996,7 @@ export class DefinitionAdapter<T extends ILanguageWorkerWithDefinitions> impleme
     const definition = await lspRequest(() => worker?.findDefinition(model.uri.toString(), fromPosition(position)), token);
     if (definition) {
       const links = (Array.isArray(definition) ? definition : [definition]).map(convertLocationLink);
-      await ensureHttpModels(links);
+      await ensureTargetModels(links);
       return links;
     }
   }
@@ -1027,19 +1031,41 @@ function convertLocationLink(location: lst.Location | lst.LocationLink): Monaco.
   };
 }
 
-async function ensureHttpModels(links: Monaco.languages.LocationLink[]): Promise<void> {
+/**
+ * Materialize models for navigation targets that don't have one yet.
+ *
+ * Monaco can only navigate to a resource it can resolve to a model, and the
+ * language service deliberately reads some files without creating one: CDN
+ * `.d.ts` live in the http cache, and dependency declarations live in the
+ * worker's own cache (a model per `.d.ts` would flood the main thread for a
+ * package with thousands of type files). Definition and reference results are
+ * few, so materializing just those is cheap — and without it, go-to-definition
+ * into `/node_modules` silently does nothing.
+ */
+async function ensureTargetModels(links: Monaco.languages.LocationLink[]): Promise<void> {
   const { editor, Uri } = monaco;
-  const httpUrls = new Set<string>(
+  const missing = new Set<string>(
     links
       .map(link => link.uri)
-      .filter(uri => !editor.getModel(uri) && (uri.scheme === "https" || uri.scheme === "http"))
-      .map(uri => uri.toString()),
+      .filter(uri => !editor.getModel(uri) && (uri.scheme === "https" || uri.scheme === "http" || uri.scheme === "file"))
+      // `toString(true)` keeps the path unescaped: a workspace fs looks paths
+      // up literally, so an escaped `@scope` would miss every scoped package.
+      .map(uri => uri.toString(true)),
   );
   await Promise.all(
-    [...httpUrls].map(async url => {
-      const text = await cache.fetch(url).then(res => res.text());
-      const uri = Uri.parse(url);
-      if (!editor.getModel(uri)) {
+    [...missing].map(async href => {
+      const uri = Uri.parse(href);
+      if (editor.getModel(uri)) {
+        return;
+      }
+      let text: string | undefined;
+      if (uri.scheme === "file") {
+        if (!activeWorkspace) return;
+        text = await activeWorkspace.fs.readTextFile(href).catch(() => undefined);
+      } else {
+        text = await cache.fetch(href).then(res => res.text()).catch(() => undefined);
+      }
+      if (text !== undefined && !editor.getModel(uri)) {
         editor.createModel(text, undefined, uri);
       }
     }),
@@ -1069,7 +1095,7 @@ export class ReferenceAdapter<T extends ILanguageWorkerWithReferences> implement
     const references = await lspRequest(() => worker?.findReferences(model.uri.toString(), fromPosition(position)), token);
     if (references) {
       const links = references.map(convertLocationLink);
-      await ensureHttpModels(links);
+      await ensureTargetModels(links);
       return links;
     }
   }
