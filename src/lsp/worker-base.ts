@@ -78,6 +78,30 @@ export class WorkerBase<Host = undefined, LanguageDocument = undefined> {
   }
 
   /**
+   * Read many `file:` paths in ONE bridge round-trip (see client.createHost).
+   * Falls back to per-file reads if the host doesn't implement `fs_getContents`.
+   * This is what makes large-package type resolution fast: the whole `.d.ts`
+   * graph arrives at once instead of one RPC per file (which deadlocks Monaco's
+   * single worker↔main channel for packages with thousands of type files).
+   */
+  async fsReadBatch(uris: string[]): Promise<(string | undefined)[]> {
+    const host = this.#ctx.host as {
+      fs_getContents?: (u: string[]) => Promise<(string | undefined)[]>;
+      fs_getContent: (u: string) => Promise<string>;
+    };
+    if (typeof host.fs_getContents === "function") {
+      return host.fs_getContents(uris);
+    }
+    return Promise.all(uris.map(async (u) => {
+      try {
+        return await host.fs_getContent(u);
+      } catch {
+        return undefined;
+      }
+    }));
+  }
+
+  /**
    * Stat a `file:` path asynchronously through the host fs bridge, caching the
    * result (1 = file, 2 = dir, 0 = missing) so subsequent synchronous lookups
    * via `fsKnownType` succeed. Returns the resolved entry type.
@@ -174,6 +198,21 @@ export class WorkerBase<Host = undefined, LanguageDocument = undefined> {
     return entries;
   }
 
+  /** Recursively list all file hrefs under a directory (uses the walked fs). */
+  listFilesRecursive(uri: string, extensions?: readonly string[]): string[] {
+    const out: string[] = [];
+    if (!this.#fs) return out;
+    const prefix = uri.endsWith("/") ? uri : uri + "/";
+    for (const [path, type] of this.#fs) {
+      if (type === 1 && path.startsWith(prefix)) {
+        if (!extensions || extensions.some((ext) => path.endsWith(ext))) {
+          out.push(path);
+        }
+      }
+    }
+    return out;
+  }
+
   getFileSystemProvider() {
     if (this.#fs) {
       const host = this.#ctx.host;
@@ -212,19 +251,35 @@ export class WorkerBase<Host = undefined, LanguageDocument = undefined> {
 
   async fsNotify(kind: "create" | "remove" | "modify", path: string, type?: number): Promise<void> {
     const fs = this.#fs ?? (this.#fs = new Map());
+    // Host watchers pass bare VFS paths (`/node_modules/...`); the walked fs
+    // map is keyed by `file://` hrefs — normalize so create/remove stay coherent.
+    const href = path.startsWith("file://")
+      ? (path.length > "file:///".length && path.endsWith("/") ? path.slice(0, -1) : path)
+      : "file://" + (path.startsWith("/") ? path : "/" + path);
     if (kind === "create") {
       if (type) {
         const entryType = type as FileSystemEntryType;
-        fs.set(path, entryType);
-        this.#statCache.set(path, entryType);
-        this.#trackNodeModule(path);
+        fs.set(href, entryType);
+        this.#statCache.set(href, entryType);
+        this.#trackNodeModule(href);
+        // Ensure parent directories exist so readDir / listFilesRecursive work
+        // for packages installed after the initial workspace walk.
+        let dir = href.slice(0, href.lastIndexOf("/"));
+        while (dir.length > "file://".length) {
+          if (fs.has(dir)) break;
+          fs.set(dir, 2);
+          const slash = dir.lastIndexOf("/");
+          if (slash <= "file://".length) break;
+          dir = dir.slice(0, slash);
+        }
       }
     } else if (kind === "remove") {
-      if (fs.get(path) === 1) {
+      if (fs.get(href) === 1) {
+        this.#documentCache.delete(href);
         this.#documentCache.delete(path);
       }
-      fs.delete(path);
-      this.#statCache.set(path, 0);
+      fs.delete(href);
+      this.#statCache.set(href, 0);
     }
   }
 

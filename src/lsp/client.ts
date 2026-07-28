@@ -25,6 +25,18 @@ export function createHost(workspace?: Workspace) {
       fs_getContent: (uri: string): Promise<string> => {
         return workspace.fs.readTextFile(uri);
       },
+      // Batched read: one worker→main round-trip returns many files at once.
+      // The main thread has the whole VFS in memory, so this is far faster than
+      // one fs_getContent RPC per file for large packages (e.g. lucide-react).
+      fs_getContents: async (uris: string[]): Promise<(string | undefined)[]> => {
+        return Promise.all(uris.map(async (uri) => {
+          try {
+            return await workspace.fs.readTextFile(uri);
+          } catch {
+            return undefined;
+          }
+        }));
+      },
     }
     : Object.create(null);
 }

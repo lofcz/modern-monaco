@@ -9,8 +9,16 @@ const bundleTypescriptLibs = async () => {
   const glob = new Bun.Glob("node_modules/typescript/lib/lib.*.d.ts");
   const dtsFiles = [...glob.scanSync()];
   dtsFiles.sort();
+  // Bun.Glob on Windows yields backslash paths; basename via `/` split alone
+  // leaves keys like `node_modules\typescript\lib\lib.dom.d.ts`, which the
+  // worker never finds (it looks up `lib.dom.d.ts`). Normalize separators.
   const libs = Object.fromEntries(
-    await Promise.all(dtsFiles.map(async (path) => [path.split("/").at(-1)!, await Bun.file(path).text()])),
+    await Promise.all(
+      dtsFiles.map(async (filePath) => {
+        const name = filePath.replaceAll("\\", "/").split("/").at(-1)!;
+        return [name, await Bun.file(filePath).text()] as const;
+      }),
+    ),
   );
   await Bun.write(
     "dist/lsp/typescript/libs.mjs",
@@ -118,8 +126,16 @@ const runBuild = (entryPoints: string[], define?: Record<string, string>) => {
       {
         name: "external",
         setup(build: any) {
+          // Shim Node builtins that the bundled TypeScript references at init.
+          // esbuild's platform:"browser" otherwise disables them (empty module),
+          // and `os.platform()` etc. throw, killing the worker. Mapped here to
+          // a virtual shim namespace handled by onLoad below.
+          const NODE_BUILTINS = new Set(["os", "fs", "path", "crypto", "node:os", "node:fs", "node:path", "node:crypto"]);
           build.onResolve({ filter: /.*/ }, (args: { path: string; resolveDir: string }) => {
-            if (args.path === "typescript" || args.path.endsWith(".wasm")) {
+            if (NODE_BUILTINS.has(args.path)) {
+              return { path: args.path.replace(/^node:/, ""), namespace: "node-shim" };
+            }
+            if (args.path.endsWith(".wasm")) {
               return {
                 path: args.path,
                 external: true,
@@ -138,6 +154,18 @@ const runBuild = (entryPoints: string[], define?: Record<string, string>) => {
               };
             }
             return {};
+          });
+          build.onLoad({ filter: /.*/, namespace: "node-shim" }, (args: { path: string }) => {
+            const name = args.path;
+            // CommonJS shims (module.exports) so TypeScript's `require("os")`
+            // interops to the object itself, not `{ default: ... }`.
+            const shims: Record<string, string> = {
+              os: `module.exports = { platform: () => "browser", EOL: "\\n", tmpdir: () => "/tmp" };`,
+              fs: `module.exports = { realpathSync: Object.assign((p) => p, { native: (p) => p }), statSync: () => { throw new Error("fs.statSync unavailable in browser"); }, existsSync: () => false, readFileSync: () => { throw new Error("fs.readFileSync unavailable in browser"); }, writeFileSync: () => {}, directoryExists: () => false, getDirectories: () => [], readDirectory: () => [] };`,
+              path: `module.exports = { join: (...p) => p.filter(Boolean).join("/"), dirname: (p) => p.slice(0, p.lastIndexOf("/")) || "/", resolve: (...p) => p.filter(Boolean).join("/"), basename: (p) => p.slice(p.lastIndexOf("/") + 1), extname: (p) => { const i = p.lastIndexOf("."); return i < 0 ? "" : p.slice(i); }, sep: "/", delimiter: ":" };`,
+              crypto: `module.exports = undefined;`,
+            };
+            return { contents: shims[name] ?? "module.exports = {};", loader: "js" };
           });
         },
       },

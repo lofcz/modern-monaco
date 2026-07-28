@@ -1,6 +1,9 @@
 import type monacoNS from "monaco-editor-core";
 import type * as lst from "vscode-languageserver-types";
 import { ImportMap, type ImportMapRaw } from "@esm.sh/import-map";
+// Bundled into the worker at build time (esbuild converts the CJS typescript.js
+// to ESM), so the worker is fully self-contained — no CDN/import-map needed to
+// resolve its `typescript` import.
 import ts from "typescript";
 import {
   CompletionItemKind,
@@ -89,6 +92,21 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   #pkgJson = new Map<string, string>();
   /** In-flight package probes, keyed by bare specifier (dedupes host fs_stat round-trips). */
   #pkgProbes = new Map<string, Promise<void>>();
+  /**
+   * Content of node_modules `.d.ts` files read directly through the fs bridge.
+   * Caching text here lets TS read dependency types from worker memory instead
+   * of materializing a Monaco model per `.d.ts` — opening thousands of models
+   * (e.g. lucide-react) flooded the main thread and froze the editor.
+   */
+  #nodeModulesContent = new Map<string, string>();
+  /** In-flight content fetches, keyed by `.d.ts` href (dedupes parallel reads). */
+  #nodeModulesFetches = new Map<string, Promise<void>>();
+  /** In-flight bulk package prefetches, keyed by package root. */
+  #pkgPrefetches = new Map<string, Promise<void>>();
+  /** Bumped when node_modules content is cached, so TS re-reads those files. */
+  #nodeModulesVersion = 0;
+  /** Bumped when CDN/http `.d.ts` libs are cached (esm.sh etc.). */
+  #httpLibsVersion = 0;
 
   constructor(ctx: monacoNS.worker.IWorkerContext<Host>, createData: CreateData) {
     super(ctx, createData);
@@ -109,8 +127,15 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   }
 
   getDirectories(path: string): string[] {
-    if (path === "/node_modules/@types") {
-      return [];
+    // Expose installed DefinitelyTyped packages so tsc's @types lookup works
+    // the same as a real node_modules tree (`react` → `@types/react`, …).
+    if (path === "/node_modules/@types" || path === "file:///node_modules/@types") {
+      const names: string[] = [];
+      for (const root of this.nodeModulePaths) {
+        const prefix = "file:///node_modules/@types/";
+        if (root.startsWith(prefix)) names.push(root.slice(prefix.length));
+      }
+      return names;
     }
     if (path.startsWith("file:///node_modules/")) {
       // todo: use closest index.html(importmap)
@@ -144,10 +169,14 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
 
   fileExists(filename: string): boolean {
     // Bare-specifier type resolution (node_modules mode) resolves real .d.ts
-    // files under /node_modules and opens them as background models; TS must be
-    // allowed to read those. Everything else under /node_modules stays invisible
-    // to TS (the importmap mode never reads from there).
-    if (filename.startsWith("/node_modules/")) return this.hasModel(filename);
+    // files under /node_modules; TS must be allowed to read those — either from
+    // the worker's content cache (#nodeModulesContent) or an opened model.
+    // Everything else under /node_modules stays invisible to TS.
+    // TS queries files by both bare path and `file://` href depending on how
+    // they were resolved; match the worker cache on either form.
+    if (filename.startsWith("/node_modules/") || filename.startsWith("file:///node_modules/")) {
+      return this.#nodeModulesContent.has(filename) || this.hasModel(filename);
+    }
     return (
       filename in libs
       || `lib.${filename}.d.ts` in libs
@@ -192,6 +221,17 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     return filenames;
   }
 
+  // Bumping the project version forces TS to rebuild the program (re-running
+  // module resolution + re-reading source files) once asynchronously-fetched
+  // node_modules type content lands in the worker cache.
+  getProjectVersion(): string {
+    // Include http-lib + import-map versions so resolving bare imports to
+    // newly-fetched CDN `.d.ts` (esm.sh / same-origin proxy) invalidates the
+    // program. Without this, TS keeps the initial `.js`/7016 resolution forever
+    // even after x-typescript-types has been fetched and cached.
+    return "nm" + this.#nodeModulesVersion + ".h" + this.#httpLibsVersion + ".i" + this.#importMapVersion;
+  }
+
   getScriptVersion(fileName: string): string {
     if (fileName in this.#types) {
       return String(this.#types[fileName].version);
@@ -204,6 +244,11 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       || this.#httpTsModules.has(fileName)
     ) {
       return "1"; // static/remote modules/types
+    }
+    // node_modules types cached in the worker: version tracks when content was
+    // fetched so TS re-reads the file once its text arrives.
+    if (this.#nodeModulesContent.has(fileName)) {
+      return "nm." + this.#nodeModulesVersion;
     }
     const model = this.getModel(fileName);
     if (model) {
@@ -398,13 +443,21 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
               const dts = res.headers.get("x-typescript-types");
               if (res.redirected) {
                 this.#urlMappings.set(moduleHref, res.url);
-              } else if (dts) {
-                res.body?.cancel();
-                const dtsRes = await cache.fetch(new URL(dts, res.url));
+              }
+              // Process types even when the response was a redirect — esm.sh
+              // often 302s to a .mjs while still advertising x-typescript-types
+              // on the final response (or on the cached redirect target).
+              if (dts) {
+                res.body?.cancel?.();
+                const dtsUrl = new URL(dts, res.url || moduleHref);
+                const dtsRes = await cache.fetch(dtsUrl);
                 if (dtsRes.ok) {
                   const dtsText = await dtsRes.text();
-                  this.#typesMappings.set(moduleHref, dtsRes.url);
-                  this.#addHttpLib(dtsRes.url, dtsText);
+                  // Prefer the request URL when Response.url is empty (some
+                  // cache reconstructions omit it) so fileExists/readFile match.
+                  const resolvedDts = dtsRes.url || dtsUrl.href;
+                  this.#typesMappings.set(moduleHref, resolvedDts);
+                  this.#addHttpLib(resolvedDts, dtsText);
                 }
               } else if (
                 /\.(c|m)?jsx?$/.test(moduleUrl.pathname)
@@ -461,7 +514,10 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
         }
       }
       // resolving modules...
-      return { resolvedFileName: specifier, extension: ".js" };
+      // If the import-map target is already a `.d.ts`, don't pretend it's JS
+      // while the fetch is in flight (avoids a flash of 7016).
+      const pendingExt = /\.d\.(c|m)?ts$/i.test(moduleUrl.pathname) ? ".d.ts" : ".js";
+      return { resolvedFileName: specifier, extension: pendingExt };
     }).map((resolvedModule) => {
       return { resolvedModule };
     });
@@ -923,9 +979,19 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       this.#updateJsxImportSource();
     }
     if (importMap) {
-      this.#importMap = new ImportMap(importMap, "file:///");
-      this.#importMapVersion++;
-      this.#updateJsxImportSource();
+      const next = new ImportMap(importMap, "file:///");
+      // Avoid clearing CDN type caches + bumping project version when the host
+      // re-pushes an identical map after Install (common warm-cache reload).
+      const prevJson = JSON.stringify(this.#importMap?.imports ?? {});
+      const nextJson = JSON.stringify(next.imports ?? {});
+      if (prevJson !== nextJson) {
+        this.#importMap = next;
+        this.#importMapVersion++;
+        this.#typesMappings.clear();
+        this.#unknownImports.clear();
+        this.#badImports.clear();
+        this.#updateJsxImportSource();
+      }
     }
     if (types) {
       for (const uri of Object.keys(this.#types)) {
@@ -1201,19 +1267,28 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     const { pkgRoot, pkgName, subpath } = splitNodeSpecifier(specifier);
     if (!pkgName) return undefined;
 
+    const cacheKey = pkgRoot + (subpath ? "/" + subpath : "");
+
     // Fast path: we already resolved this package's types entry.
-    const knownEntry = this.#pkgTypes.get(pkgRoot + (subpath ? "/" + subpath : ""));
-    if (knownEntry && this.hasFsPath(knownEntry)) {
+    const knownEntry = this.#pkgTypes.get(cacheKey);
+    if (knownEntry && (this.hasFsPath(knownEntry) || this.#nodeModulesContent.has(knownEntry) || this.hasModel(knownEntry))) {
       return this.#openAndResolve(knownEntry, containingFile);
     }
 
     // Synchronous candidate scan: try the conventional .d.ts locations that we
-    // already know exist (mirror models / walked fs / stat cache).
-    const pkgJson = this.#pkgJson.get(pkgRoot + "/package.json");
-    for (const candidate of this.#nodeTypesCandidates(pkgRoot, subpath, pkgJson)) {
-      if (this.hasModel(candidate) || this.hasFsPath(candidate)) {
-        this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), candidate);
-        return this.#openAndResolve(candidate, containingFile);
+    // already know exist (mirror models / walked fs / stat cache). Also check
+    // DefinitelyTyped (`@types/<pkg>`) — react etc. ship no bundled .d.ts.
+    const roots = [pkgRoot];
+    if (!pkgName.startsWith("@types/")) {
+      roots.push("file:///node_modules/" + atTypesPackageName(pkgName));
+    }
+    for (const root of roots) {
+      const pkgJson = this.#pkgJson.get(root + "/package.json");
+      for (const candidate of this.#nodeTypesCandidates(root, subpath, pkgJson)) {
+        if (this.hasModel(candidate) || this.hasFsPath(candidate) || this.#nodeModulesContent.has(candidate)) {
+          this.#pkgTypes.set(cacheKey, candidate);
+          return this.#openAndResolve(candidate, containingFile);
+        }
       }
     }
 
@@ -1243,7 +1318,32 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       }
     }
     if (!this.hasFileSystemProvider) return undefined;
-    // Ensure the model exists so TS can read its text; re-resolve afterwards.
+    // node_modules dependency types: cache their text in the worker (fetched
+    // via the fs bridge, in parallel) instead of opening a Monaco model per
+    // file — see #nodeModulesContent. TS reads it via #getScriptText.
+    if (dtsHref.startsWith("file:///node_modules/")) {
+      if (!this.#nodeModulesContent.has(dtsHref) && !this.#nodeModulesFetches.has(dtsHref)) {
+        this.#nodeModulesFetches.set(
+          dtsHref,
+          this.fsRead(dtsHref)
+            .then((text) => {
+              this.#nodeModulesContent.set(dtsHref, text);
+              this.#nodeModulesVersion++;
+              this.#rollbackVersion(containingFile);
+            })
+            .catch(() => {
+              this.#badImports.add(dtsHref);
+              this.#rollbackVersion(containingFile);
+            })
+            .finally(() => {
+              this.#nodeModulesFetches.delete(dtsHref);
+              this.host.refreshDiagnostics(containingFile);
+            }),
+        );
+      }
+      return { resolvedFileName: dtsHref, extension };
+    }
+    // Non-node_modules: open the model so TS can read its text; re-resolve after.
     if (!this.#openPromises.has(dtsHref)) {
       this.#openPromises.set(
         dtsHref,
@@ -1299,35 +1399,112 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
    * Probe an installed package through the host fs bridge: read its
    * package.json, compute the types entry, verify the .d.ts exists, then open
    * it as a model so its text is available to the language service.
+   * Falls back to DefinitelyTyped (`@types/<pkg>`) when the runtime package
+   * ships no types — matching tsc's node_modules resolution.
    */
   async #probeNodeModule(pkgRoot: string, pkgName: string, subpath: string): Promise<void> {
-    const pkgJsonHref = pkgRoot + "/package.json";
-    // Cache the package.json for future synchronous resolutions.
-    if (!this.#pkgJson.has(pkgJsonHref)) {
-      try {
-        this.#pkgJson.set(pkgJsonHref, await this.fsRead(pkgJsonHref));
-      } catch {
-        this.#pkgJson.set(pkgJsonHref, "");
-      }
+    const cacheKey = pkgRoot + (subpath ? "/" + subpath : "");
+    const roots = [pkgRoot];
+    if (!pkgName.startsWith("@types/")) {
+      roots.push("file:///node_modules/" + atTypesPackageName(pkgName));
     }
-    const pkgJson = this.#pkgJson.get(pkgJsonHref);
-    for (const candidate of this.#nodeTypesCandidates(pkgRoot, subpath, pkgJson)) {
-      const type = await this.fsProbe(candidate);
-      if (type === 1) {
-        this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), candidate);
-        await this.host.openModel(candidate);
-        return;
+
+    for (const root of roots) {
+      const pkgJsonHref = root + "/package.json";
+      // Cache the package.json for future synchronous resolutions.
+      if (!this.#pkgJson.has(pkgJsonHref)) {
+        try {
+          this.#pkgJson.set(pkgJsonHref, await this.fsRead(pkgJsonHref));
+        } catch {
+          this.#pkgJson.set(pkgJsonHref, "");
+        }
+      }
+      const pkgJson = this.#pkgJson.get(pkgJsonHref);
+      // Empty package.json means the package (or @types fallback) isn't installed.
+      if (!pkgJson) continue;
+
+      // Warm the package's whole .d.ts graph in the background via BATCHED bridge
+      // reads (fsReadBatch = one RPC per chunk, not per file), so TS's program
+      // build hits the worker cache instead of issuing one RPC per internal
+      // import. Without this, a package with thousands of type files (lucide-react)
+      // monopolizes the single worker↔main channel for minutes and hover stalls.
+      void this.#prefetchNodeModule(root);
+
+      for (const candidate of this.#nodeTypesCandidates(root, subpath, pkgJson)) {
+        const type = await this.fsProbe(candidate);
+        if (type === 1) {
+          this.#pkgTypes.set(cacheKey, candidate);
+          // Cache the entry's text now so the first hover on the import resolves
+          // to real types without waiting for the background package prefetch.
+          if (!this.#nodeModulesContent.has(candidate)) {
+            try {
+              this.#nodeModulesContent.set(candidate, await this.fsRead(candidate));
+            } catch {
+              // fall back to on-demand read
+            }
+          }
+          return;
+        }
       }
     }
     // No types found; remember so we don't keep probing. (Package may be
-    // untyped — that's fine, tsc reports it the same way.)
-    this.#pkgTypes.set(pkgRoot + (subpath ? "/" + subpath : ""), "");
+    // untyped — that's fine, tsc reports it the same way.) Cleared on later
+    // fsNotify when @types lands after install.
+    this.#pkgTypes.set(cacheKey, "");
+  }
+
+  /**
+   * Invalidate negative type-resolution results when `/node_modules` changes
+   * (e.g. installer finishes unpacking `@types/react` after an earlier miss).
+   */
+  override async fsNotify(kind: "create" | "remove" | "modify", path: string, type?: number): Promise<void> {
+    await super.fsNotify(kind, path, type);
+    if (!path.includes("/node_modules/")) return;
+    let cleared = false;
+    for (const [key, value] of this.#pkgTypes) {
+      if (value === "") {
+        this.#pkgTypes.delete(key);
+        cleared = true;
+      }
+    }
+    if (cleared || kind === "create") {
+      this.#nodeModulesVersion++;
+    }
+  }
+
+  /**
+   * Fetch every `.d.ts` file under a package root into the worker cache in a
+   * single parallel batch, with a single project-version bump at the end (so
+   * TS rebuilds the program once, not once per file). Deduped per package.
+   */
+  #prefetchNodeModule(pkgRoot: string): Promise<void> {
+    let pending = this.#pkgPrefetches.get(pkgRoot);
+    if (!pending) {
+      pending = (async () => {
+        const files = this.listFilesRecursive(pkgRoot, [".d.ts", ".d.mts", ".d.cts"])
+          .filter((f) => !this.#nodeModulesContent.has(f));
+        // Batched reads (one bridge round-trip per chunk) — see fsReadBatch.
+        const CHUNK = 64;
+        for (let i = 0; i < files.length; i += CHUNK) {
+          const chunk = files.slice(i, i + CHUNK);
+          const contents = await this.fsReadBatch(chunk);
+          for (let j = 0; j < chunk.length; j++) {
+            if (contents[j] !== undefined) this.#nodeModulesContent.set(chunk[j], contents[j]!);
+          }
+        }
+        // One bump + one re-resolve for the whole batch.
+        this.#nodeModulesVersion++;
+      })();
+      this.#pkgPrefetches.set(pkgRoot, pending);
+    }
+    return pending;
   }
 
   #getScriptText(fileName: string): string | undefined {
     return libs[fileName]
       ?? libs[`lib.${fileName}.d.ts`]
       ?? this.#types[fileName]?.content
+      ?? this.#nodeModulesContent.get(fileName)
       ?? this.#httpLibs.get(fileName)
       ?? this.#httpModules.get(fileName)
       ?? this.#httpTsModules.get(fileName)
@@ -1355,31 +1532,49 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   }
 
   #addHttpLib(url: string, dtsContent: string): void {
+    const prev = this.#httpLibs.get(url);
     this.#httpLibs.set(url, dtsContent);
-    setTimeout(() => {
-      // resolve types reference directives
-      // e.g. `/// <reference types="./common.d.ts" />`
-      const referencedFiles = this.#languageService.getProgram()?.getSourceFile(url)?.referencedFiles ?? [];
-      referencedFiles.forEach((ref) => {
-        const refUrl = new URL(ref.fileName, url).href;
-        if (isDts(refUrl) && !this.#fetchPromises.has(refUrl) && !this.#httpLibs.has(refUrl) && !this.#badImports.has(refUrl)) {
-          this.#fetchPromises.set(
-            refUrl,
-            cache.fetch(refUrl).then(async res => {
-              if (res.ok) {
-                this.#httpLibs.set(refUrl, await res.text());
-              } else {
-                this.#badImports.add(refUrl);
-              }
-            }).catch(err => {
-              console.error(`Failed to fetch types: ${refUrl}`, err);
-            }).finally(() => {
-              this.#fetchPromises.delete(refUrl);
-            }),
-          );
-        }
-      });
-    });
+    if (prev !== dtsContent) this.#httpLibsVersion++;
+    // Prefetch graph edges immediately (no setTimeout). Waiting a tick meant
+    // IntelliSense stayed on 7016 until a second diagnostic pass after
+    // relatives landed — noticeable with large CDN libs.
+    const pull = (refUrl: string) => {
+      if (this.#fetchPromises.has(refUrl) || this.#httpLibs.has(refUrl) || this.#badImports.has(refUrl)) {
+        return;
+      }
+      this.#fetchPromises.set(
+        refUrl,
+        cache.fetch(refUrl).then(async (res) => {
+          if (res.ok) {
+            this.#addHttpLib(refUrl, await res.text());
+          } else {
+            this.#badImports.add(refUrl);
+          }
+        }).catch((err) => {
+          console.error(`Failed to fetch types: ${refUrl}`, err);
+        }).finally(() => {
+          this.#fetchPromises.delete(refUrl);
+          this.#httpLibsVersion++;
+        }),
+      );
+    };
+    // `/// <reference path="..." />` once the source file exists in the program
+    const referencedFiles = this.#languageService.getProgram()?.getSourceFile(url)?.referencedFiles ?? [];
+    for (const ref of referencedFiles) {
+      const refUrl = new URL(ref.fileName, url).href;
+      if (isDts(refUrl)) pull(refUrl);
+    }
+    // Relative imports / path refs (strip comments — JSDoc examples often
+    // contain fake `from './user-context'` paths that 404 on the CDN).
+    const code = dtsContent.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    for (const m of code.matchAll(/\bfrom\s+["'](\.[^"']+)["']/g)) {
+      let refUrl = new URL(m[1], url).href;
+      if (!isDts(refUrl) && !/\.(c|m)?tsx?$/.test(refUrl)) refUrl += ".d.ts";
+      if (isDts(refUrl) || /\.(c|m)?tsx?$/.test(refUrl)) pull(refUrl);
+    }
+    for (const m of code.matchAll(/\/\/\/\s*<reference\s+path=["']([^"']+)["']\s*\/>/g)) {
+      pull(new URL(m[1], url).href);
+    }
   }
 
   #getSpecifierFromDts(filename: string): string | void {
@@ -1621,6 +1816,19 @@ function splitNodeSpecifier(specifier: string): { pkgRoot: string; pkgName: stri
     pkgName,
     subpath: rest.join("/"),
   };
+}
+
+/**
+ * DefinitelyTyped package name for a runtime package.
+ * `react` → `@types/react`, `@babel/core` → `@types/babel__core`.
+ */
+function atTypesPackageName(pkgName: string): string {
+  if (pkgName.startsWith("@types/")) return pkgName;
+  if (pkgName.startsWith("@")) {
+    const [scope, name] = pkgName.slice(1).split("/");
+    return `@types/${scope}__${name}`;
+  }
+  return `@types/${pkgName}`;
 }
 
 /**

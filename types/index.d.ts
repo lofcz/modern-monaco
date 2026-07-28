@@ -3,6 +3,17 @@ import type { LSPConfig } from "./lsp.d.ts";
 import type { TextmateGrammarName, TextmateThemeName } from "./textmate.d.ts";
 import { FileSystem, NotFoundError, Workspace } from "./workspace";
 
+// Re-export the full virtual-filesystem surface so consumers can implement a
+// custom `FileSystem` (e.g. bridging an in-memory store) with the same types.
+export type {
+  FileSystemEntryType,
+  FileSystemWatchContext,
+  FileSystemWatchHandle,
+  FileStat,
+  WorkspaceInit,
+} from "./workspace";
+export { NotFoundError };
+
 type Awaitable<T> = T | Promise<T>;
 type MaybeGetter<T> = Awaitable<MaybeModule<T>> | (() => Awaitable<MaybeModule<T>>);
 type MaybeModule<T> = T | { default: T };
