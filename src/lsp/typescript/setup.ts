@@ -455,7 +455,7 @@ function parseJsonc(text: string) {
   }
 }
 
-/** Wait for the initialized worker to acquire the supplied models' declaration graph. */
+/** Acquire the supplied models' declaration graph and publish their fresh diagnostics. */
 export async function waitForTypeResolution(resources: monacoNS.Uri[], timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const work = async () => {
@@ -467,6 +467,7 @@ export async function waitForTypeResolution(resources: monacoNS.Uri[], timeoutMs
     await current.withSyncedResources(resources);
     const proxy = await current.getProxy();
     await proxy.waitForTypeResolution();
+    await client.flushDiagnostics(resources);
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

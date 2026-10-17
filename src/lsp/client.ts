@@ -14,6 +14,14 @@ export function init(monacoNS: typeof Monaco): void {
   monaco = monacoNS;
 }
 
+/** Publish fresh diagnostics without waiting for the interactive edit debounce. */
+export async function flushDiagnostics(resources: Monaco.Uri[]): Promise<void> {
+  await Promise.all(resources.map((uri) => {
+    const model = monaco.editor.getModel(uri);
+    return model && Reflect.get(model, "flushDiagnostics")?.();
+  }));
+}
+
 /** create a worker host with the given workspace. */
 export function createHost(workspace?: Workspace) {
   return workspace
@@ -205,7 +213,7 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
 ) {
   const { editor } = monaco;
   const modelChangeListeners = new Map<string, Monaco.IDisposable>();
-  const doValidate = async (model: Monaco.editor.ITextModel) => {
+  const doValidate = async (model: Monaco.editor.ITextModel, throwOnError = false) => {
     try {
       const workerProxy = await worker.withSyncedResources([model.uri]);
       const diagnostics = await workerProxy.doValidation(model.uri.toString());
@@ -227,7 +235,8 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
         }
         monaco.editor.setModelMarkers(model, languageId, markers);
       }
-    } catch {
+    } catch (error) {
+      if (throwOnError) throw error;
       // Transient races (file not yet in the TS program, pending .d.ts fetch,
       // disposed model) must not surface as unhandled promise rejections.
     }
@@ -252,6 +261,11 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
 
     modelChangeListeners.set(uri, model.onDidChangeContent(validate));
     Reflect.set(model, "refreshDiagnostics", validate);
+    Reflect.set(model, "flushDiagnostics", () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      return doValidate(model, true);
+    });
     void doValidate(model);
   };
   const onModelDispose = (model: Monaco.editor.IModel): void => {
@@ -261,6 +275,7 @@ function registerDiagnostics<T extends ILanguageWorkerWithValidation>(
       modelChangeListeners.delete(uri);
     }
     Reflect.deleteProperty(model, "refreshDiagnostics");
+    Reflect.deleteProperty(model, "flushDiagnostics");
     editor.setModelMarkers(model, languageId, []);
   };
   editor.onDidCreateModel(validateModel);

@@ -31,7 +31,7 @@ test("awaits a delayed declaration graph with extensionless sources, mapped bare
   expect(requests).toEqual(expect.arrayContaining(Object.keys(declarations)));
   expect(requests).not.toContain("/type-acquisition/core.d.ts");
   expect(requests).not.toContain("/type-acquisition/core/vanilla/.d.ts");
-  await expect.poll(() => page.evaluate(() => {
+  expect(await page.evaluate(() => {
     const { monaco } = (window as any).__e2e;
     return monaco.editor.getModelMarkers({}).map((marker: any) => ({
       file: marker.resource.path, code: String(marker.code?.value ?? marker.code),
@@ -54,7 +54,7 @@ test("resolves a previously missing extensionless import after its source model 
     monaco.editor.createModel("export const count: number = 1;", "typescript", monaco.Uri.file("late.ts"));
     await (window as any).__e2e.settle();
   });
-  await expect.poll(() => page.evaluate(() => {
+  expect(await page.evaluate(() => {
     const { monaco } = (window as any).__e2e;
     return monaco.editor.getModelMarkers({}).map((marker: any) => String(marker.code?.value ?? marker.code));
   })).toEqual(["2322"]);
