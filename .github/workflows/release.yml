@@ -41,6 +41,12 @@ jobs:
       - name: Build
         run: bun scripts/build.ts
 
+      - name: Install test browser
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run browser regression tests
+        run: bunx playwright test
+
       - name: Bump package version
         id: version
         run: |

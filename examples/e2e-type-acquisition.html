@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Type acquisition regression</title>
+  <script type="importmap">
+    {"imports":{
+      "modern-monaco":"/modern-monaco/index.mjs",
+      "modern-monaco/workspace":"/modern-monaco/workspace.mjs",
+      "modern-monaco/editor-core":"/modern-monaco/editor-core.mjs",
+      "modern-monaco/lsp":"/modern-monaco/lsp/index.mjs"
+    }}
+  </script>
+</head>
+<body>
+  <div id="editor" style="height:400px"></div>
+  <script type="module">
+    import { init } from "modern-monaco";
+    import { Workspace } from "modern-monaco/workspace";
+    import { waitForTypeResolution } from "/modern-monaco/lsp/typescript/setup.mjs";
+
+    const late = new URL(location.href).searchParams.has("late");
+    const files = late ? {
+      "main.ts": 'import { count } from "./late"; export const value: string = count;',
+    } : {
+      "main.ts": 'import App from "./App"; import { useStore } from "./state"; export const value: string = useStore.getState().count; export const rendered = App();',
+      "App.tsx": 'import { useStore } from "./state"; export default function App() { return useStore.getState().count; }',
+      "state/index.ts": 'export { useStore } from "store-lib";',
+    };
+    const workspace = new Workspace({ name: "e2e-type-acquisition-" + Date.now() });
+    if (!late) await workspace.fs.createDirectory("state");
+    for (const [path, content] of Object.entries(files)) await workspace.fs.writeFile(path, content);
+    const monaco = await init({
+      workspace,
+      lsp: { typescript: {
+        compilerOptions: { strict: true, jsx: "preserve" },
+        importMap: { imports: {
+          "store-lib": location.origin + "/type-acquisition/store/index.d.ts",
+          "store-core": location.origin + "/type-acquisition/core",
+        } },
+      } },
+    });
+    const editor = monaco.editor.create(document.getElementById("editor"));
+    await workspace.openTextDocument("main.ts");
+    for (const [path, content] of Object.entries(files)) {
+      const uri = monaco.Uri.file(path);
+      if (!monaco.editor.getModel(uri)) monaco.editor.createModel(content, undefined, uri);
+    }
+    window.__e2e = {
+      monaco, editor, workspace,
+      settle: () => waitForTypeResolution(monaco.editor.getModels().map(model => model.uri)),
+    };
+  </script>
+</body>
+</html>

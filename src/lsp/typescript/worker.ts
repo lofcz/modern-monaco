@@ -262,18 +262,30 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     return count + "_" + (signature >>> 0).toString(36);
   }
 
+  async waitForTypeResolution(): Promise<void> {
+    for (let pass = 0; pass < 50; pass++) {
+      for (const model of this.getMirrorModels()) {
+        this.#languageService.getSemanticDiagnostics(model.uri.toString());
+      }
+      const pending = [...this.#fetchPromises.values(), ...this.#openPromises.values(), ...this.#pkgProbes.values()];
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+    throw new Error("Type resolution did not converge; inspect the package declarations.");
+  }
+
   getScriptVersion(fileName: string): string {
     if (fileName in this.#types) {
       return String(this.#types[fileName].version);
     }
+    if (fileName in libs) return "1";
     if (
-      fileName in libs
-      || fileName in this.#types
-      || this.#httpLibs.has(fileName)
+      this.#httpLibs.has(fileName)
       || this.#httpModules.has(fileName)
       || this.#httpTsModules.has(fileName)
     ) {
-      return "1"; // static/remote modules/types
+      // Re-resolve declaration re-exports when their asynchronous types arrive.
+      return "http." + this.#httpLibsVersion + "." + this.#importMapVersion;
     }
     // node_modules types cached in the worker: version tracks when content was
     // fetched so TS re-reads the file once its text arrives.
@@ -372,12 +384,12 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       } catch (error) {
         return undefined;
       }
-      if (getScriptExtension(moduleUrl.pathname) === null) {
+      if (!importMapResolved && isRelativePath(literal.text) && getScriptExtension(moduleUrl.pathname) === null) {
         const ext = getScriptExtension(containingFile);
         // use the extension of the containing file which is a dts file
         // when the module name has no extension.
         if (ext === ".d.ts" || ext === ".d.mts" || ext === ".d.cts") {
-          moduleUrl.pathname += ext;
+          moduleUrl.pathname += (moduleUrl.pathname.endsWith("/") ? "index" : "") + ext;
         }
       }
       if (this.#httpModules.has(containingFile)) {
@@ -389,6 +401,17 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       }
       if (moduleUrl.protocol === "file:") {
         const moduleHref = moduleUrl.href;
+        // Resolve extensionless local imports after their source models sync.
+        // A previous failed lookup must not hide a newly opened model.
+        if (getScriptExtension(moduleUrl.pathname) === null) {
+          for (const suffix of [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js"]) {
+            const candidate = new URL(moduleUrl.href);
+            candidate.pathname += suffix;
+            if (this.hasModel(candidate.href)) {
+              return { resolvedFileName: candidate.href, extension: getScriptExtension(candidate.pathname)! };
+            }
+          }
+        }
         if (this.#badImports.has(moduleHref)) {
           return undefined;
         }
@@ -1711,7 +1734,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     const code = dtsContent.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
     for (const m of code.matchAll(/\bfrom\s+["'](\.[^"']+)["']/g)) {
       let refUrl = new URL(m[1], url).href;
-      if (!isDts(refUrl) && !/\.(c|m)?tsx?$/.test(refUrl)) refUrl += ".d.ts";
+      if (!isDts(refUrl) && !/\.(c|m)?tsx?$/.test(refUrl)) refUrl += (refUrl.endsWith("/") ? "index" : "") + ".d.ts";
       if (isDts(refUrl) || /\.(c|m)?tsx?$/.test(refUrl)) pull(refUrl);
     }
     for (const m of code.matchAll(/\/\/\/\s*<reference\s+path=["']([^"']+)["']\s*\/>/g)) {

@@ -158,6 +158,10 @@ async function createWorker(
         }
         if (model) {
           Reflect.get(model, "refreshDiagnostics")?.();
+        } else if (/^https?:/.test(uri)) {
+          for (const consumer of monaco.editor.getModels()) {
+            Reflect.get(consumer, "refreshDiagnostics")?.();
+          }
         }
       },
     } satisfies Host,
@@ -448,5 +452,33 @@ function parseJsonc(text: string) {
     const stringOrTrailingCommaRe = /("(?:\\?[^])*?")|(,\s*)(?=]|})/g;
     const fixed = text.replace(stringOrCommentRe, "$1").replace(stringOrTrailingCommaRe, "$1");
     return JSON.parse(fixed);
+  }
+}
+
+/** Wait for the initialized worker to acquire the supplied models' declaration graph. */
+export async function waitForTypeResolution(resources: monacoNS.Uri[], timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const work = async () => {
+    while (!worker) {
+      if (Date.now() >= deadline) throw new Error("Browser typechecker did not initialize.");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const current = await worker;
+    await current.withSyncedResources(resources);
+    const proxy = await current.getProxy();
+    await proxy.waitForTypeResolution();
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("Browser package types did not finish loading. Retry verification; do not reinstall the packages."));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
