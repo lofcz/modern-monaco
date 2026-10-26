@@ -245,13 +245,13 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       + ".m" + this.#mirrorModelsSignature();
   }
 
-  /** Order-independent signature of the synced model set (count + XOR of URI hashes). */
+  /** Include revisions: TS skips even getScriptVersion while the project is unchanged. */
   #mirrorModelsSignature(): string {
     let count = 0;
     let signature = 0;
     for (const model of this.getMirrorModels()) {
       count++;
-      const uri = model.uri.toString();
+      const uri = model.uri.toString() + "\0" + model.version;
       let hash = 2166136261;
       for (let i = 0; i < uri.length; i++) {
         hash ^= uri.charCodeAt(i);
