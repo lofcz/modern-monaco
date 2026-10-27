@@ -59,3 +59,28 @@ test("resolves a previously missing extensionless import after its source model 
     return monaco.editor.getModelMarkers({}).map((marker: any) => String(marker.code?.value ?? marker.code));
   })).toEqual(["2322"]);
 });
+
+test("refreshes added and changed package mappings in an already open editor", async ({context,page})=>{
+ await context.route('**/late-package-v*.d.ts',route=>route.fulfill({contentType:'application/typescript',body:route.request().url().includes('v1')?'export const count: number;':'export const count: string;'}));
+ await page.goto('/e2e-type-acquisition.html?late');
+ await page.waitForFunction(()=>(window as any).__e2e);
+ await page.evaluate(async()=>{
+  const {monaco}=(window as any).__e2e;
+  monaco.editor.getModel(monaco.Uri.file('main.ts')).setValue('import {count} from "new-package"; export const result: string = count;');
+  await (window as any).__e2e.settle();
+ });
+ const codes=()=>page.evaluate(()=>(window as any).__e2e.monaco.editor.getModelMarkers({}).filter((m:any)=>m.resource.path==='/main.ts').map((m:any)=>String(m.code?.value??m.code)));
+ await expect.poll(codes).toContain('2307');
+ await page.evaluate(async()=>{
+  const {updateImportMap}=await import('/modern-monaco/lsp/typescript/setup.mjs');
+  await updateImportMap({imports:{'new-package':location.origin+'/late-package-v1.d.ts'}});
+  await (window as any).__e2e.settle();
+ });
+ await expect.poll(codes).toEqual(['2322']);
+ await page.evaluate(async()=>{
+  const {updateImportMap}=await import('/modern-monaco/lsp/typescript/setup.mjs');
+  await updateImportMap({imports:{'new-package':location.origin+'/late-package-v2.d.ts'}});
+  await (window as any).__e2e.settle();
+ });
+ await expect.poll(codes).toEqual([]);
+});

@@ -29,6 +29,16 @@ type TypeScriptLanguageSettings = {
 
 // javascript and typescript share the same worker
 let worker: TSWorker | Promise<TSWorker> | null = null;
+let refreshTypeDiagnostics: (() => void) | undefined;
+
+/** Refresh dynamically installed package mappings without recreating the editor. */
+export async function updateImportMap(importMap: ImportMapRaw): Promise<void> {
+  if (!worker) throw new Error("TypeScript worker has not initialized");
+  const current = await worker;
+  const proxy = await current.getProxy();
+  await proxy.updateCompilerOptions({ importMap });
+  refreshTypeDiagnostics?.();
+}
 
 export async function setup(
   monaco: typeof monacoNS,
@@ -45,6 +55,7 @@ export async function setup(
   }
   // initialize lsp client
   client.init(monaco);
+  refreshTypeDiagnostics = () => monaco.editor.getModels().forEach(model => Reflect.get(model, "refreshDiagnostics")?.());
 
   // register language features
   client.registerBasicFeatures(languageId, worker, [".", "/", '"', "'", "<"], workspace, languageSettings?.diagnosticsOptions);
