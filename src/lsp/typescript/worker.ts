@@ -392,6 +392,16 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
           moduleUrl.pathname += (moduleUrl.pathname.endsWith("/") ? "index" : "") + ext;
         }
       }
+      if (isHttpUrl(containingFile) && isDts(containingFile)) {
+        for (const twin of declarationTwins(moduleUrl.pathname)) {
+          const candidate = new URL(moduleUrl);
+          candidate.pathname = twin;
+          if (!this.#badImports.has(candidate.href)) {
+            moduleUrl = candidate;
+            break;
+          }
+        }
+      }
       if (this.#httpModules.has(containingFile)) {
         // ignore dependencies of http modules
         return {
@@ -524,6 +534,10 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
                 /\.(c|m)?jsx?$/.test(moduleUrl.pathname)
                 || (contentType && /^(application|text)\/(javascript|jsx)/.test(contentType))
               ) {
+                if (await this.#acquirePackageTypes(moduleUrl, moduleHref)) {
+                  res.body?.cancel();
+                  return;
+                }
                 const esmModulePath = parseEsmModulePath(moduleUrl);
                 if (esmModulePath) {
                   const [pkgName, pkgVersion, target, subPath] = esmModulePath;
@@ -1696,6 +1710,67 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     return null;
   }
 
+  /** npm CDN modules without a types header still have package metadata.
+   * Use the package's declarations, then its matching DefinitelyTyped release;
+   * never infer the bundled JavaScript before checking the published types. */
+  async #acquirePackageTypes(moduleUrl: URL, moduleHref: string): Promise<boolean> {
+    const match = moduleUrl.pathname.match(/^\/((?:@[^/]+\/)?[^/@]+)@([^/]+)(?:\/(.*))?$/);
+    if (!match || match[1].startsWith("@types/")) return false;
+    const [, name, version, subpath = ""] = match;
+    const root = new URL(`/${name}@${version}/`, moduleUrl);
+    let pkg: Record<string, unknown>;
+    try {
+      const response = await cache.fetch(new URL("package.json?raw", root));
+      if (!response.ok) {
+        response.body?.cancel();
+        return false;
+      }
+      pkg = await response.json();
+      if (pkg.name !== name) return false;
+    } catch {
+      return false;
+    }
+    const tryPackage = async (base: URL, metadata: Record<string, unknown>): Promise<boolean> => {
+      const candidates = this.#nodeTypesCandidates(base.href.replace(/\/$/, ""), subpath, JSON.stringify(metadata));
+      for (const candidate of new Set(candidates)) {
+        const response = await cache.fetch(candidate);
+        if (!response.ok) {
+          response.body?.cancel();
+          continue;
+        }
+        const text = await response.text();
+        if (response.headers.get("content-type")?.includes("text/html")) continue;
+        const resolved = response.url || candidate;
+        this.#typesMappings.set(moduleHref, resolved);
+        this.#addHttpLib(resolved, text);
+        return true;
+      }
+      return false;
+    };
+    if (await tryPackage(root, pkg)) return true;
+    // DefinitelyTyped versions track the runtime major/minor; their patch
+    // releases are independent. Use a compatible line, never latest types for
+    // an unrelated runtime version. An absent package falls back to JS inference.
+    const release = typeof pkg.version === "string" ? pkg.version.match(/^(\d+)\.(\d+)/) : null;
+    if (!release) return false;
+    const range = release[1] === "0" ? `${release[1]}.${release[2]}` : release[1];
+    const typesRoot = new URL(`/${atTypesPackageName(name)}@${range}/`, moduleUrl);
+    try {
+      const response = await cache.fetch(new URL("package.json?raw", typesRoot));
+      if (!response.ok) {
+        response.body?.cancel();
+        return false;
+      }
+      const metadata = await response.json();
+      if (metadata.name !== atTypesPackageName(name)) return false;
+      // Anchor relative imports to the exact version returned by the CDN.
+      const resolvedRoot = response.url ? new URL("./", response.url) : typesRoot;
+      return await tryPackage(resolvedRoot, metadata);
+    } catch {
+      return false;
+    }
+  }
+
   #addHttpLib(url: string, dtsContent: string): void {
     const prev = this.#httpLibs.get(url);
     this.#httpLibs.set(url, dtsContent);
@@ -1723,22 +1798,21 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
         }),
       );
     };
-    // `/// <reference path="..." />` once the source file exists in the program
-    const referencedFiles = this.#languageService.getProgram()?.getSourceFile(url)?.referencedFiles ?? [];
-    for (const ref of referencedFiles) {
-      const refUrl = new URL(ref.fileName, url).href;
-      if (isDts(refUrl)) pull(refUrl);
+    // Scan declaration edges without constructing the TS program for every
+    // arriving file. Large graphs otherwise rebuild hundreds of times before
+    // the network can finish, starving diagnostics and verification.
+    const references = ts.preProcessFile(dtsContent, true, false);
+    for (const ref of references.referencedFiles) {
+      pull(new URL(ref.fileName, url).href);
     }
-    // Relative imports / path refs (strip comments — JSDoc examples often
-    // contain fake `from './user-context'` paths that 404 on the CDN).
-    const code = dtsContent.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    for (const m of code.matchAll(/\bfrom\s+["'](\.[^"']+)["']/g)) {
-      let refUrl = new URL(m[1], url).href;
+    for (const ref of references.importedFiles) {
+      if (!isRelativePath(ref.fileName)) continue;
+      const relative = new URL(ref.fileName, url);
+      const twin = declarationTwins(relative.pathname)[0];
+      if (twin) relative.pathname = twin;
+      let refUrl = relative.href;
       if (!isDts(refUrl) && !/\.(c|m)?tsx?$/.test(refUrl)) refUrl += (refUrl.endsWith("/") ? "index" : "") + ".d.ts";
       if (isDts(refUrl) || /\.(c|m)?tsx?$/.test(refUrl)) pull(refUrl);
-    }
-    for (const m of code.matchAll(/\/\/\/\s*<reference\s+path=["']([^"']+)["']\s*\/>/g)) {
-      pull(new URL(m[1], url).href);
     }
   }
 

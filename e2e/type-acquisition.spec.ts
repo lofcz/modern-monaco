@@ -84,3 +84,39 @@ test("refreshes added and changed package mappings in an already open editor", a
  });
  await expect.poll(codes).toEqual([]);
 });
+
+// CDN and package names are fixtures: the same resolver must work for any
+// library and both named and namespace imports, without host-app mappings.
+for (const external of [false, true]) {
+ test(`acquires ${external ? 'DefinitelyTyped' : 'bundled'} declarations without a CDN header`, async ({context,page})=>{
+  const seen:string[]=[];
+  const root='/@scope/widgets@2.4.3';
+  const types='/@types/scope__widgets@2';
+  const files:Record<string,string>={
+   [root]:'export class Widget { constructor() {} }',
+   [root+'/package.json']:JSON.stringify({name:'@scope/widgets',version:'2.4.3',...(external?{}:{exports:{'.':{types:'./types/index.d.ts'}}})}),
+   [(external?types:root+'/types')+'/index.d.ts']:'export { Widget } from "./Widget.js"; export type { Options } from "./options.mjs";',
+   [(external?types:root+'/types')+'/Widget.d.ts']:'export declare class Widget { value: number; setValue(value: number): void; }',
+   [(external?types:root+'/types')+'/options.d.mts']:'export interface Options { enabled: boolean; }',
+   ...(external?{[types+'/package.json']:JSON.stringify({name:'@types/scope__widgets',version:'2.4.9',types:'index.d.ts'})}:{}),
+  };
+  await context.route('**/@scope/**',respond);await context.route('**/@types/**',respond);
+  async function respond(route:any){const path=new URL(route.request().url()).pathname;seen.push(path);const body=files[path];await route.fulfill({status:body===undefined?404:200,body:body??'Missing',contentType:path.endsWith('.json')?'application/json':/\.d\.(m|c)?ts$/.test(path)?'application/typescript':'application/javascript'});}
+  await page.goto('/e2e-type-acquisition.html?late');await page.waitForFunction(()=>(window as any).__e2e);
+  await page.evaluate(()=>(window as any).__e2e.settle());
+  await page.evaluate(async(root)=>{
+   const {monaco,workspace}=(window as any).__e2e;
+   const {updateImportMap}=await import('/modern-monaco/lsp/typescript/setup.mjs');
+   await updateImportMap({imports:{widgets:location.origin+root}});
+   const source = 'import * as W from "widgets"; import { Widget } from "widgets"; const first: W.Widget = new W.Widget(); const second: Widget = first; second.setValue(2); export const options: W.Options = { enabled: true }; export const wrong: string = first.value;';
+   await workspace.fs.writeFile('main.ts',source);
+   monaco.editor.getModel(monaco.Uri.file('main.ts')).setValue(source);
+   await (window as any).__e2e.settle();
+  },root);
+  const markers=()=>page.evaluate(async()=>{ await (window as any).__e2e.settle(); return (window as any).__e2e.monaco.editor.getModelMarkers({}).filter((m:any)=>m.resource.path==='/main.ts').map((m:any)=>({code:String(m.code?.value??m.code),message:m.message})); });
+  await expect.poll(markers).toEqual([{code:'2322',message:"Type 'number' is not assignable to type 'string'."}]);
+  expect(seen).not.toContain(expect.stringContaining('.js.d.ts'));
+  expect(seen).not.toContain(expect.stringContaining('.mjs.d.ts'));
+  if(!external)expect(seen.some(path=>path.startsWith('/@types/'))).toBe(false);
+ });
+}
