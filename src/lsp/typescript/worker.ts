@@ -17,6 +17,7 @@ import {
   SymbolKind,
 } from "vscode-languageserver-types";
 import { TextDocument, WorkerBase, type WorkerCreateData } from "../worker-base.ts";
+import { type ApiSymbolQueryOptions, type ApiSymbolQueryResult, queryApiSymbols } from "./api-symbols.ts";
 
 // ! external modules, don't remove the `.js` extension
 // @ts-expect-error 'libs.js' is generated at build time
@@ -114,6 +115,14 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
   #nodeModulesVersion = 0;
   /** Bumped when CDN/http `.d.ts` libs are cached (esm.sh etc.). */
   #httpLibsVersion = 0;
+  /**
+   * Worker-only sources for API queries: part of the program while a query
+   * runs, but never a Monaco model, so they produce no markers or editor state.
+   */
+  #queryDocuments = new Map<string, string>();
+  #querySeq = 0;
+  /** Bumped when a query document is added or removed. */
+  #queryVersion = 0;
 
   constructor(ctx: monacoNS.worker.IWorkerContext<Host>, createData: CreateData) {
     super(ctx, createData);
@@ -191,6 +200,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       || this.#httpLibs.has(filename)
       || this.#httpModules.has(filename)
       || this.#httpTsModules.has(filename)
+      || this.#queryDocuments.has(filename)
       || this.hasModel(filename)
     );
   }
@@ -225,6 +235,9 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     for (const filename of this.#httpTsModules.keys()) {
       filenames[i++] = filename;
     }
+    for (const filename of this.#queryDocuments.keys()) {
+      filenames.push(filename);
+    }
     return filenames;
   }
 
@@ -242,7 +255,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     // project version is unchanged, so without it every feature on a
     // newly-opened file fails with "Could not find source file".
     return "nm" + this.#nodeModulesVersion + ".h" + this.#httpLibsVersion + ".i" + this.#importMapVersion
-      + ".m" + this.#mirrorModelsSignature();
+      + ".m" + this.#mirrorModelsSignature() + ".q" + this.#queryVersion;
   }
 
   /** Include revisions: TS skips even getScriptVersion while the project is unchanged. */
@@ -274,11 +287,43 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
     throw new Error("Type resolution did not converge; inspect the package declarations.");
   }
 
+  /**
+   * Describe the public API of `specifier` (a bare package name, import-map key,
+   * URL, or workspace-relative path such as `"./src/lib"`) as the editor's
+   * TypeScript program sees it: exports, a symbol's type, overloads, JSDoc,
+   * members and declaration locations. Declarations are acquired first, exactly
+   * as for an import in an open file.
+   */
+  async queryApiSymbols(specifier: string, options: ApiSymbolQueryOptions = {}): Promise<ApiSymbolQueryResult> {
+    if (typeof specifier !== "string" || specifier.trim() === "") {
+      throw new Error("specifier must be a non-empty string");
+    }
+    // At the workspace root so relative specifiers resolve against the project.
+    const uri = `file:///__modern_monaco_api_query_${++this.#querySeq}__.ts`;
+    this.#queryDocuments.set(uri, `import * as __api from ${JSON.stringify(specifier)};\nexport { __api };\n`);
+    this.#queryVersion++;
+    try {
+      for (let pass = 0; pass < 50; pass++) {
+        this.#languageService.getSemanticDiagnostics(uri);
+        const pending = [...this.#fetchPromises.values(), ...this.#openPromises.values(), ...this.#pkgProbes.values()];
+        if (pending.length === 0) {
+          return queryApiSymbols(ts, this.#languageService, uri, specifier, options);
+        }
+        await Promise.allSettled(pending);
+      }
+      throw new Error("API declaration resolution did not converge; inspect the package declarations.");
+    } finally {
+      this.#queryDocuments.delete(uri);
+      this.#queryVersion++;
+    }
+  }
+
   getScriptVersion(fileName: string): string {
     if (fileName in this.#types) {
       return String(this.#types[fileName].version);
     }
     if (fileName in libs) return "1";
+    if (this.#queryDocuments.has(fileName)) return "q." + this.#importMapVersion;
     if (
       this.#httpLibs.has(fileName)
       || this.#httpModules.has(fileName)
@@ -419,6 +464,17 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
             candidate.pathname += suffix;
             if (this.hasModel(candidate.href)) {
               return { resolvedFileName: candidate.href, extension: getScriptExtension(candidate.pathname)! };
+            }
+          }
+          // Not open yet: pick the workspace file the specifier names and open it,
+          // instead of asking the host for the extensionless path (which never exists).
+          if (this.hasFileSystemProvider) {
+            for (const suffix of [".ts", ".tsx", ".mts", ".cts", ".d.ts", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.d.ts", "/index.js", "/index.jsx"]) {
+              const candidate = new URL(moduleUrl.href);
+              candidate.pathname += suffix;
+              if (this.#workspaceFileExists(candidate.href)) {
+                return this.#openAndResolve(candidate.href, containingFile);
+              }
             }
           }
         }
@@ -1406,6 +1462,13 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
    * async probe is started and `containingFile` re-resolves once it lands, the
    * same pattern `#resolveNodeModuleTypes` uses.
    */
+  /** Whether the worker's workspace fs index lists `href` as a file. */
+  #workspaceFileExists(href: string): boolean {
+    const slash = href.lastIndexOf("/");
+    const name = href.slice(slash + 1);
+    return this.readDir(href.slice(0, slash + 1)).some(([entry, type]) => type === 1 && entry === name);
+  }
+
   #resolveDeclarationTwin(moduleUrl: URL, containingFile: string): string | undefined {
     const twins = declarationTwins(moduleUrl.pathname);
     if (twins.length === 0) return undefined;
@@ -1676,6 +1739,7 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
       ?? this.#httpLibs.get(fileName)
       ?? this.#httpModules.get(fileName)
       ?? this.#httpTsModules.get(fileName)
+      ?? this.#queryDocuments.get(fileName)
       ?? this.getModel(fileName)?.getValue();
   }
 

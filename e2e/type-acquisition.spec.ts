@@ -75,6 +75,74 @@ test("opens .js-specified TypeScript sources and JSON imports in the background"
   expect(await markers()).toHaveLength(2);
 });
 
+test("queries a workspace module's API without opening editor models", async ({ page }) => {
+  await page.goto("/e2e-type-acquisition.html?api");
+  await page.waitForFunction(() => (window as any).__e2e);
+  const q = (specifier: string, options?: object) =>
+    page.evaluate(async ([specifier, options]) => {
+      const { queryApiSymbols } = await import("/modern-monaco/lsp/typescript/setup.mjs");
+      return queryApiSymbols(specifier, options);
+    }, [specifier, options] as const);
+  const before = await page.evaluate(() => (window as any).__e2e.monaco.editor.getModels().map((m: any) => m.uri.path).sort());
+
+  const all = await q("./lib/api");
+  expect(all).toMatchObject({ status: "resolved", total: 5, truncated: false });
+  expect(all.exports.map((e: any) => e.name).sort()).toEqual(["Camera", "Context", "Options", "Shapes", "light"]);
+
+  const first = await q("./lib/api", { limit: 2 });
+  expect(first).toMatchObject({ truncated: true, nextOffset: 2 });
+  const rest = await q("./lib/api", { limit: 10, offset: 2 });
+  expect(rest.nextOffset).toBeUndefined();
+  expect(new Set([...first.exports, ...rest.exports].map((e: any) => e.name)).size).toBe(5);
+  expect((await q("./lib/api", { filter: "opt" })).exports).toEqual([{ name: "Options" }]);
+
+  const camera = await q("./lib/api", { symbol: "Camera" });
+  expect(camera.documentation).toMatch(/test camera/);
+  expect(camera.members.map((m: any) => m.name).sort()).toEqual(["fov", "update"]);
+  const update = await q("./lib/api", { symbol: "Camera.update" });
+  expect(update.signatures[0]).toMatch(/delta: number/);
+  expect(update.documentation).toBe("Advance time.");
+  expect(update.definitions[0]).toMatchObject({ uri: "file:///lib/base.ts" });
+
+  const light = await q("./lib/api", { symbol: "light" });
+  expect(light.signatures).toHaveLength(2);
+  expect(light.tags[0].name).toBe("deprecated");
+  expect((await q("./lib/api", { symbol: "Context.options.intensity" })).type).toBe("number");
+  expect((await q("./lib/api", { symbol: "Shapes.Box.width" })).type).toBe("number");
+  expect((await q("./lib/api", { symbol: "Nope" })).status).toBe("not-found");
+  expect((await q("./lib/api", { symbol: "Camera.nope" })).status).toBe("not-found");
+  const missing = await q("./does-not-exist");
+  expect(missing.status).toBe("unresolved");
+  expect(missing.diagnostics.join("\n")).toMatch(/does-not-exist/);
+
+  // Background opening may add source models; the query file itself must never become one.
+  const after = await page.evaluate(() => (window as any).__e2e.monaco.editor.getModels().map((m: any) => m.uri.path));
+  expect(after.some((p: string) => p.includes("api_query"))).toBe(false);
+  expect(after).toEqual(expect.arrayContaining(before));
+  // Files opened for the query are checked like any import: no errors once their imports load.
+  await expect.poll(() => page.evaluate(() => (window as any).__e2e.monaco.editor.getModelMarkers({})
+    .filter((m: any) => m.severity >= 4).map((m: any) => m.resource.path + ":" + m.message)), { timeout: 5000 }).toEqual([]);
+});
+
+test("queries an import-mapped CDN package's API after acquiring its declarations", async ({ context, page }) => {
+  await context.route("**/api-pkg/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const body = path === "/api-pkg/index.d.ts"
+      ? 'export { Store } from "./store";'
+      : path === "/api-pkg/store.d.ts" ? "/** A store. */ export declare class Store<T> { get(): T; set(value: T): void; }" : undefined;
+    return route.fulfill({ status: body ? 200 : 404, body: body ?? "Missing", contentType: "application/typescript" });
+  });
+  await page.goto("/e2e-type-acquisition.html?api");
+  await page.waitForFunction(() => (window as any).__e2e);
+  const result = await page.evaluate(async () => {
+    const { queryApiSymbols, updateImportMap } = await import("/modern-monaco/lsp/typescript/setup.mjs");
+    await updateImportMap({ imports: { "api-pkg": location.origin + "/api-pkg/index.d.ts" } });
+    return queryApiSymbols("api-pkg", { symbol: "Store" });
+  });
+  expect(result).toMatchObject({ status: "resolved", documentation: "A store." });
+  expect(result.members.map((m: any) => m.name)).toEqual(["get", "set"]);
+});
+
 test("refreshes added and changed package mappings in an already open editor", async ({context,page})=>{
  await context.route('**/late-package-v*.d.ts',route=>route.fulfill({contentType:'application/typescript',body:route.request().url().includes('v1')?'export const count: number;':'export const count: string;'}));
  await page.goto('/e2e-type-acquisition.html?late');

@@ -23,7 +23,25 @@
     const late = params.has("late");
     // `local`: only main.ts is opened; its imports must be opened in the background.
     const local = params.has("local");
-    const files = local ? {
+    // `api`: API query fixtures, never opened as models up front.
+    const api = params.has("api");
+    const files = api ? {
+      "main.ts": "export const ok = 1;",
+      "lib/api.ts": `export { Base as Camera } from "./base";
+/** Creates lighting. @deprecated Use a pipeline. */
+export function light(value: number): number;
+export function light(value: string): string;
+export function light(value: number | string) { return value; }
+export interface Options { intensity: number; }
+export type Context = { options: Options };
+export namespace Shapes { export interface Box { width: number } export const unit = 1; }`,
+      "lib/base.ts": `class Parent {
+  /** Advance time. */
+  update(delta: number): void {}
+}
+/** A test camera. */
+export class Base extends Parent { fov = 50; }`,
+    } : local ? {
       "main.ts": 'import { n } from "./util.js"; import data from "./data.json"; export const a: string = n; export const b: string = data.count;',
       "util.ts": "export const n: number = 1;",
       "data.json": '{ "count": 1 }',
@@ -35,7 +53,8 @@
       "state/index.ts": 'export { useStore } from "store-lib";',
     };
     const workspace = new Workspace({ name: "e2e-type-acquisition-" + Date.now() });
-    if (!late) await workspace.fs.createDirectory("state");
+    if (api) await workspace.fs.createDirectory("lib");
+    else if (!late && !local) await workspace.fs.createDirectory("state");
     for (const [path, content] of Object.entries(files)) await workspace.fs.writeFile(path, content);
     const monaco = await init({
       workspace,
@@ -49,7 +68,7 @@
     });
     const editor = monaco.editor.create(document.getElementById("editor"));
     await workspace.openTextDocument("main.ts");
-    for (const [path, content] of local ? [] : Object.entries(files)) {
+    for (const [path, content] of local || api ? [] : Object.entries(files)) {
       const uri = monaco.Uri.file(path);
       if (!monaco.editor.getModel(uri)) monaco.editor.createModel(content, undefined, uri);
     }

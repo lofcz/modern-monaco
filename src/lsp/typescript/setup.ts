@@ -4,6 +4,7 @@ import type { FormattingOptions } from "vscode-languageserver-types";
 import type { Workspace } from "~/workspace";
 import type { DiagnosticsOptions } from "~/lsp/client.ts";
 import type { CreateData, Host, ModuleResolutionMode, TypeScriptWorker, VersionedContent } from "./worker";
+import type { ApiSymbolQueryOptions, ApiSymbolQueryResult } from "./api-symbols.ts";
 import { ImportMap, type ImportMapRaw, parseFromHtml } from "@esm.sh/import-map";
 
 // ! external modules, don't remove the `.js` extension
@@ -154,6 +155,9 @@ async function createWorker(
         }
         try {
           await workspace._openBackgroundDocument(monaco, uri);
+          // Mirror it into the worker now (also for other languages, e.g. imported
+          // JSON) so the retried resolution sees it. From needle-tools/modern-monaco.
+          await worker.withSyncedResources([monaco.Uri.parse(uri)]);
           return true;
         } catch (error) {
           if (isFsNotFoundError(error)) {
@@ -463,6 +467,38 @@ function parseJsonc(text: string) {
     const stringOrTrailingCommaRe = /("(?:\\?[^])*?")|(,\s*)(?=]|})/g;
     const fixed = text.replace(stringOrCommentRe, "$1").replace(stringOrTrailingCommaRe, "$1");
     return JSON.parse(fixed);
+  }
+}
+
+/**
+ * Describe a module's public API (exports, a symbol's type, overloads, JSDoc, members,
+ * declaration locations) as the editor's TypeScript program resolves it.
+ * `specifier` is anything an import in a workspace file could name.
+ */
+export async function queryApiSymbols(
+  specifier: string,
+  options: ApiSymbolQueryOptions = {},
+  timeoutMs = 30_000,
+): Promise<ApiSymbolQueryResult> {
+  const deadline = Date.now() + timeoutMs;
+  const work = async () => {
+    while (!worker) {
+      if (Date.now() >= deadline) throw new Error("Browser typechecker did not initialize.");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const proxy = await (await worker).getProxy();
+    return proxy.queryApiSymbols(specifier, options);
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`API declarations for "${specifier}" did not finish loading within ${timeoutMs}ms.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
