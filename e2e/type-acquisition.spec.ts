@@ -60,6 +60,21 @@ test("resolves a previously missing extensionless import after its source model 
   })).toEqual(["2322"]);
 });
 
+test("opens .js-specified TypeScript sources and JSON imports in the background", async ({ page }) => {
+  await page.goto("/e2e-type-acquisition.html?local");
+  await page.waitForFunction(() => (window as any).__e2e);
+  const markers = () => page.evaluate(async () => {
+    await (window as any).__e2e.settle();
+    const { monaco } = (window as any).__e2e;
+    return monaco.editor.getModelMarkers({}).filter((m: any) => m.resource.path === "/main.ts")
+      .map((m: any) => String(m.code?.value ?? m.code) + ":" + m.startColumn).sort();
+  });
+  // Exactly the two deliberate string/number mismatches; no 2307 for either import.
+  await expect.poll(markers).toEqual(expect.arrayContaining([expect.stringMatching(/^2322:/), expect.stringMatching(/^2322:/)]));
+  expect((await markers()).every((m) => m.startsWith("2322:"))).toBe(true);
+  expect(await markers()).toHaveLength(2);
+});
+
 test("refreshes added and changed package mappings in an already open editor", async ({context,page})=>{
  await context.route('**/late-package-v*.d.ts',route=>route.fulfill({contentType:'application/typescript',body:route.request().url().includes('v1')?'export const count: number;':'export const count: string;'}));
  await page.goto('/e2e-type-acquisition.html?late');

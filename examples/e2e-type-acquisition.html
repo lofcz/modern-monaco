@@ -19,8 +19,15 @@
     import { Workspace } from "modern-monaco/workspace";
     import { waitForTypeResolution } from "/modern-monaco/lsp/typescript/setup.mjs";
 
-    const late = new URL(location.href).searchParams.has("late");
-    const files = late ? {
+    const params = new URL(location.href).searchParams;
+    const late = params.has("late");
+    // `local`: only main.ts is opened; its imports must be opened in the background.
+    const local = params.has("local");
+    const files = local ? {
+      "main.ts": 'import { n } from "./util.js"; import data from "./data.json"; export const a: string = n; export const b: string = data.count;',
+      "util.ts": "export const n: number = 1;",
+      "data.json": '{ "count": 1 }',
+    } : late ? {
       "main.ts": 'import { count } from "./late"; export const value: string = count;',
     } : {
       "main.ts": 'import App from "./App"; import { useStore } from "./state"; export const value: string = useStore.getState().count; export const rendered = App();',
@@ -33,7 +40,7 @@
     const monaco = await init({
       workspace,
       lsp: { typescript: {
-        compilerOptions: { strict: true, jsx: "preserve" },
+        compilerOptions: { strict: true, jsx: "preserve", resolveJsonModule: true, moduleResolution: "bundler", module: "esnext" },
         importMap: { imports: {
           "store-lib": location.origin + "/type-acquisition/store/index.d.ts",
           "store-core": location.origin + "/type-acquisition/core",
@@ -42,7 +49,7 @@
     });
     const editor = monaco.editor.create(document.getElementById("editor"));
     await workspace.openTextDocument("main.ts");
-    for (const [path, content] of Object.entries(files)) {
+    for (const [path, content] of local ? [] : Object.entries(files)) {
       const uri = monaco.Uri.file(path);
       if (!monaco.editor.getModel(uri)) monaco.editor.createModel(content, undefined, uri);
     }
