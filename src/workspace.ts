@@ -127,7 +127,36 @@ export class Workspace implements IWorkspace {
       return existing;
     }
     const content = await this._fs.readTextFile(href);
-    return monaco.editor.createModel(content, undefined, modelUri);
+    // Re-check: another caller may have created the model while we awaited.
+    const model = monaco.editor.getModel(modelUri) ?? monaco.editor.createModel(content, undefined, modelUri);
+    this._observeModel(model, href);
+    return model;
+  }
+
+  /** Persist model edits to the fs and reload the model on external changes (once per model). */
+  _observeModel(model: monacoNS.editor.ITextModel, href: string): void {
+    if (Reflect.has(model, "__OB__")) {
+      return;
+    }
+    const fs = this._fs;
+    const persist = createPersistTask(() => fs.writeFile(href, model.getValue(), { isModelContentChange: true }));
+    const disposable = model.onDidChangeContent(persist);
+    const unwatch = fs.watch(href, (kind, _, __, context) => {
+      if (kind === "modify" && (!context || !context.isModelContentChange)) {
+        fs.readTextFile(href).then((content) => {
+          if (model.getValue() !== content) {
+            model.setValue(content);
+            model.pushStackElement();
+          }
+        });
+      }
+    });
+    model.onWillDispose(() => {
+      Reflect.deleteProperty(model, "__OB__");
+      disposable.dispose();
+      unwatch();
+    });
+    Reflect.set(model, "__OB__", true);
   }
 
   async _openTextDocument(
@@ -143,25 +172,8 @@ export class Workspace implements IWorkspace {
     const viewState = await this.viewState.get(href);
     const modelUri = monaco.Uri.parse(href);
     const model = monaco.editor.getModel(modelUri) ?? monaco.editor.createModel(content, undefined, modelUri);
-    if (!Reflect.has(model, "__OB__") && typeof readonlyContent !== "string") {
-      const persist = createPersistTask(() => fs.writeFile(href, model.getValue(), { isModelContentChange: true }));
-      const disposable = model.onDidChangeContent(persist);
-      const unwatch = fs.watch(href, (kind, _, __, context) => {
-        if (kind === "modify" && (!context || !context.isModelContentChange)) {
-          fs.readTextFile(href).then((content) => {
-            if (model.getValue() !== content) {
-              model.setValue(content);
-              model.pushStackElement();
-            }
-          });
-        }
-      });
-      model.onWillDispose(() => {
-        Reflect.deleteProperty(model, "__OB__");
-        disposable.dispose();
-        unwatch();
-      });
-      Reflect.set(model, "__OB__", true);
+    if (typeof readonlyContent !== "string") {
+      this._observeModel(model, href);
     }
     editor.setModel(model);
     editor.updateOptions({ readOnly: typeof readonlyContent === "string" });

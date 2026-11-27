@@ -1,5 +1,6 @@
 import type * as monacoNS from "./monaco.d.ts";
 import type { LSPConfig } from "./lsp.d.ts";
+import type { Highlighter } from "./shiki.d.ts";
 import type { TextmateGrammarName, TextmateThemeName } from "./textmate.d.ts";
 import { FileSystem, NotFoundError, Workspace } from "./workspace";
 
@@ -21,9 +22,12 @@ type MaybeArray<T> = T | T[];
 type LanguageInput = MaybeGetter<MaybeArray<TextmateGrammar>>;
 type ThemeInput = MaybeGetter<TextmateTheme>;
 
+export type ThemeSource = TextmateThemeName | (string & {}) | URL | ThemeInput;
+
 export type TextmateGrammar = {
   name: string;
   scopeName: string;
+  aliases?: string[];
   displayName?: string;
   foldingStartMarker?: string;
   foldingStopMarker?: string;
@@ -48,15 +52,15 @@ export interface ShikiInitOptions {
   /**
    * @deprecated Use `defaultTheme` instead.
    */
-  theme?: TextmateThemeName | (string & {}) | URL | ThemeInput;
+  theme?: ThemeSource;
   /**
    * Theme name, or theme registration object to be loaded upfront.
    */
-  defaultTheme?: TextmateThemeName | (string & {}) | URL | ThemeInput;
+  defaultTheme?: ThemeSource;
   /**
    * Additional theme names, or theme registration objects to be loaded upfront.
    */
-  themes?: (TextmateThemeName | (string & {}) | URL | ThemeInput)[];
+  themes?: ThemeSource[];
   /**
    * Language names, or language registration objects to be loaded upfront.
    */
@@ -65,9 +69,17 @@ export interface ShikiInitOptions {
    * The CDN base URL to download themes and languages from. Default: "https://esm.sh".
    */
   cdn?: string;
+  /**
+   * Custom Shiki regex engine.
+   */
+  engine?: any;
 }
 
 export interface InitOptions extends ShikiInitOptions {
+  /**
+   * Existing Shiki highlighter instance to share with the editor.
+   */
+  highlighter?: Highlighter;
   /**
    * Virtual file system to be used by the editor.
    */
@@ -79,6 +91,8 @@ export interface InitOptions extends ShikiInitOptions {
 }
 
 export function init(options?: InitOptions): Promise<typeof monacoNS>;
+/** Load and register a theme after initialization. Use editor.setTheme(name) to activate it. */
+export function loadTheme(theme: ThemeSource): Promise<void>;
 export function lazy(options?: InitOptions): void;
 export function hydrate(options?: InitOptions): void;
 

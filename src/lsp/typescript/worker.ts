@@ -530,6 +530,10 @@ export class TypeScriptWorker extends WorkerBase<Host> implements ts.LanguageSer
                   this.#typesMappings.set(moduleHref, resolvedDts);
                   this.#addHttpLib(resolvedDts, dtsText);
                 }
+              } else if (res.redirected) {
+                // redirected but no `x-typescript-types` header: the URL
+                // mapping recorded above is all we need, nothing more to fetch.
+                res.body?.cancel();
               } else if (
                 /\.(c|m)?jsx?$/.test(moduleUrl.pathname)
                 || (contentType && /^(application|text)\/(javascript|jsx)/.test(contentType))
